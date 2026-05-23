@@ -5,33 +5,44 @@
 <title>Flash Attention Benchmark - RTX 4060 Ti</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
-  body { font-family: 'Segoe UI', sans-serif; max-width:1200px; margin:20px auto; background:#1a1a2e; color:#eee; }
-  h1 { color:#e94560; text-align:center; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:30px; }
-  .card { background:#16213e; border-radius:12px; padding:20px; }
-  .card h2 { color:#0f3460; background:#e94560; padding:8px 16px; border-radius:6px; margin-top:0; }
-  canvas { background:#0f3460; border-radius:8px; }
-  .summary { background:#16213e; border-radius:12px; padding:20px; margin-top:30px; }
-  table { width:100%; border-collapse:collapse; }
-  th, td { padding:8px 12px; text-align:right; border-bottom:1px solid #333; }
-  th { background:#0f3460; color:#e94560; }
-  td:first-child, th:first-child { text-align:left; }
+  * { box-sizing:border-box; }
+  body { font-family:'Segoe UI',sans-serif; max-width:1400px; margin:20px auto; background:#1a1a2e; color:#eee; padding:0 20px; }
+  h1 { color:#e94560; text-align:center; font-size:28px; }
+  h3 { text-align:center; color:#aaa; font-weight:normal; }
+  .row { display:flex; gap:24px; margin-bottom:24px; flex-wrap:wrap; }
+  .chart-card { flex:1; min-width:500px; background:#16213e; border-radius:12px; padding:20px; }
+  .chart-card h2 { color:#fff; background:linear-gradient(135deg,#e94560,#0f3460); padding:10px 18px; border-radius:8px; margin:0 0 16px 0; font-size:16px; }
+  .chart-card canvas { width:100% !important; max-height:380px; }
+  .summary { background:#16213e; border-radius:12px; padding:24px; margin-top:30px; overflow-x:auto; }
+  .summary h2 { color:#e94560; margin-top:0; font-size:20px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; white-space:nowrap; }
+  th,td { padding:8px 14px; text-align:right; border-bottom:1px solid #333; }
+  th { background:#0f3460; color:#e94560; position:sticky; top:0; }
+  td:first-child,th:first-child { text-align:left; }
+  tr:hover td { background:rgba(233,69,96,0.08); }
   .best { color:#2ecc71; font-weight:bold; }
+  .note { color:#888; font-size:13px; margin-top:16px; line-height:1.8; }
 </style>
 </head>
 <body>
 
 <h1>⚡ Flash Attention Benchmark — RTX 4060 Ti (sm_89)</h1>
-<h3 style="text-align:center;color:#aaa;">4 Optimized Kernels × 8 Configurations  |  N ∈ {256, 512, 1024, 2048}  |  d ∈ {64, 128}</h3>
+<h3>4 Optimized Kernels × 7 Configurations  |  N ∈ {256, 512, 1024, 2048}  |  d ∈ {64, 128}</h3>
 
-<div class="grid" id="charts"></div>
+<div id="charts"></div>
 
 <div class="summary">
-<h2>📊 Performance Summary</h2>
+<h2>📊 完整数据总表</h2>
 <div id="table"></div>
+<p class="note">
+  🏆 <b>final_optimized</b> = 累计所有优化：细粒度Q/K/V tiling + P寄存器化 + cp.async双缓冲 + V复用 + f32累积 + warp shuffle写回<br>
+  📐 所有结果已验证正确性（vs CPU FP32 reference, Max error &lt; 0.06）<br>
+  ⚠️ N=2048,d=128 超出默认静态SMEM限制，未测试该配置
+</p>
 </div>
 
 <script>
+// ===== Data =====
 const raw = `kernel,N,d,time_ms,gflops
 finegrained_qk,256,64,0.0215,781.35
 register_p,256,64,0.0143,1170.29
@@ -67,11 +78,10 @@ const data = raw.split('\n').slice(1).map(l => {
   return {kernel:k, N:+N, d:+d, time_ms:+t, gflops:+g};
 });
 
-const kernels = [...new Set(data.map(r=>r.kernel))];
-const dVals = [...new Set(data.map(r=>r.d))];
-const nVals = [...new Set(data.map(r=>r.N))].sort((a,b)=>a-b);
-
+const kernels = ['finegrained_qk','register_p','async_doublebuf','final_optimized'];
+const dVals = [64, 128];
 const colors = ['#e94560','#0f3460','#3498db','#2ecc71'];
+const bgColors = ['rgba(233,69,96,0.8)','rgba(15,52,96,0.8)','rgba(52,152,219,0.8)','rgba(46,204,113,0.8)'];
 const labels = {
   finegrained_qk: 'Step1: FineGrained Q/K',
   register_p: 'Step2: Register P',
@@ -79,113 +89,111 @@ const labels = {
   final_optimized: 'Step4+5: Final',
 };
 
-// Create charts
-const grid = document.getElementById('charts');
+Chart.defaults.color = '#ccc';
+Chart.defaults.borderColor = 'rgba(255,255,255,0.1)';
+
+const chartsDiv = document.getElementById('charts');
+
+// ===== Row 1: TFLOPS bar charts =====
+const row1 = document.createElement('div');
+row1.className = 'row';
+chartsDiv.appendChild(row1);
+
 dVals.forEach(d => {
-  // TFLOPS chart
-  const card1 = document.createElement('div');
-  card1.className = 'card';
-  card1.innerHTML = `<h2>d = ${d} — TFLOPS</h2><canvas id="tflops_d${d}"></canvas>`;
-  grid.appendChild(card1);
+  const card = document.createElement('div');
+  card.className = 'chart-card';
+  card.innerHTML = `<h2>📊 d = ${d} — TFLOPS  (越高越好)</h2><canvas id="tflops_d${d}"></canvas>`;
+  row1.appendChild(card);
   
-  const ctx1 = document.getElementById(`tflops_d${d}`).getContext('2d');
   const dData = data.filter(r => r.d === d);
+  const nVals = [...new Set(dData.map(r=>r.N))].sort((a,b)=>a-b);
   
-  new Chart(ctx1, {
+  new Chart(document.getElementById(`tflops_d${d}`), {
     type: 'bar',
     data: {
-      labels: nVals.map(n => `N=${n}`),
-      datasets: kernels.map((k, i) => ({
+      labels: nVals.map(n => 'N='+n),
+      datasets: kernels.map((k,i) => ({
         label: labels[k],
-        data: nVals.map(n => {
-          const r = dData.find(x => x.N===n && x.kernel===k);
-          return r ? r.gflops/1000 : 0;
-        }),
-        backgroundColor: colors[i],
+        data: nVals.map(n => { const r=dData.find(x=>x.N===n&&x.kernel===k); return r?+(r.gflops/1000).toFixed(2):null; }),
+        backgroundColor: bgColors[i],
         borderColor: colors[i],
         borderWidth: 1,
       }))
     },
     options: {
       responsive: true,
+      maintainAspectRatio: true,
       plugins: {
-        legend: { labels: { color: '#ccc' } },
-        tooltip: { callbacks: { label: ctx => ctx.raw.toFixed(3) + ' TFLOPS' } }
+        legend: { position:'top', labels:{padding:15,usePointStyle:true,pointStyleWidth:12} },
+        tooltip: { callbacks:{label:c=>c.raw!==null?c.raw.toFixed(3)+' TFLOPS':'N/A'} }
       },
       scales: {
-        x: { ticks: { color: '#aaa' }, grid: { color: '#333' } },
-        y: { title: { display: true, text: 'TFLOPS', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } }
+        y: { title:{display:true,text:'TFLOPS'}, beginAtZero:true, grid:{color:'rgba(255,255,255,0.05)'} }
       }
     }
   });
+});
+
+// ===== Row 2: Latency (ms) line charts =====
+const row2 = document.createElement('div');
+row2.className = 'row';
+chartsDiv.appendChild(row2);
+
+dVals.forEach(d => {
+  const card = document.createElement('div');
+  card.className = 'chart-card';
+  card.innerHTML = `<h2>⏱️ d = ${d} — 耗时 Latency  (越低越好)</h2><canvas id="latency_d${d}"></canvas>`;
+  row2.appendChild(card);
   
-  // Speedup chart
-  const card2 = document.createElement('div');
-  card2.className = 'card';
-  card2.innerHTML = `<h2>d = ${d} — Speedup (vs Step1 N=256)</h2><canvas id="speedup_d${d}"></canvas>`;
-  grid.appendChild(card2);
+  const dData = data.filter(r => r.d === d);
+  const nVals = [...new Set(dData.map(r=>r.N))].sort((a,b)=>a-b);
   
-  const baseline = dData.find(r => r.N===256 && r.kernel==='finegrained_qk');
-  const ctx2 = document.getElementById(`speedup_d${d}`).getContext('2d');
-  new Chart(ctx2, {
+  new Chart(document.getElementById(`latency_d${d}`), {
     type: 'line',
     data: {
-      labels: nVals.map(n => `N=${n}`),
-      datasets: kernels.map((k, i) => ({
+      labels: nVals.map(n => 'N='+n),
+      datasets: kernels.map((k,i) => ({
         label: labels[k],
-        data: nVals.map(n => {
-          const r = dData.find(x => x.N===n && x.kernel===k);
-          return r && baseline ? (baseline.time_ms / r.time_ms).toFixed(1) : null;
-        }),
+        data: nVals.map(n => { const r=dData.find(x=>x.N===n&&x.kernel===k); return r?+r.time_ms.toFixed(3):null; }),
         borderColor: colors[i],
-        backgroundColor: colors[i],
+        backgroundColor: bgColors[i],
         tension: 0.3,
         pointRadius: 6,
         pointHoverRadius: 10,
+        borderWidth: 2.5,
+        spanGaps: false,
       }))
     },
     options: {
       responsive: true,
+      maintainAspectRatio: true,
       plugins: {
-        legend: { labels: { color: '#ccc' } },
-        tooltip: { callbacks: { label: ctx => ctx.raw + '× speedup' } }
+        legend: { position:'top', labels:{padding:15,usePointStyle:true,pointStyleWidth:12} },
+        tooltip: { callbacks:{label:c=>c.raw!==null?c.raw.toFixed(4)+' ms':'N/A'} }
       },
       scales: {
-        x: { type:'logarithmic', ticks: { color: '#aaa' }, grid: { color: '#333' } },
-        y: { title: { display: true, text: 'Speedup (×)', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' }, min: 0 }
+        x: { type:'logarithmic', title:{display:true,text:'Sequence Length N'} },
+        y: { title:{display:true,text:'Time (ms)'}, beginAtZero:true, grid:{color:'rgba(255,255,255,0.05)'} }
       }
     }
   });
 });
 
-// Summary table
+// ===== Summary table =====
+const configs = [[256,64],[256,128],[512,64],[512,128],[1024,64],[1024,128],[2048,64]];
 let html = '<table><thead><tr><th>Kernel</th>';
-nVals.forEach(n => { html += `<th colspan="3">N=${n}</th>`; });
-html += '</tr><tr><th></th>';
-nVals.forEach(() => { html += '<th>d=64 ms</th><th>GFLOPS</th><th>d=128 ms</th><th>GFLOPS</th>'; });
+configs.forEach(([n,d]) => html += `<th>N=${n}<br>d=${d}</th>`);
 html += '</tr></thead><tbody>';
 
 kernels.forEach(k => {
   html += `<tr><td><b>${labels[k]}</b></td>`;
-  nVals.forEach(n => {
-    [64,128].forEach(d => {
-      const r = data.find(x => x.N===n && x.d===d && x.kernel===k);
-      if (r) html += `<td>${r.time_ms.toFixed(3)}</td><td>${r.gflops.toFixed(0)}</td>`;
-      else html += '<td>—</td><td>—</td>';
-    });
+  configs.forEach(([n,d]) => {
+    const r = data.find(x => x.N===n && x.d===d && x.kernel===k);
+    if (r) html += `<td>${r.time_ms.toFixed(3)} ms<br><span style="color:#2ecc71">${r.gflops.toFixed(0)} GFLOPS</span></td>`;
+    else html += '<td style="color:#888">—</td>';
   });
   html += '</tr>';
 });
-
-// Best-in-class row
-html += '<tr style="font-weight:bold;background:#0f3460;"><td>🏆 Best Speedup</td>';
-nVals.forEach(n => {
-  const best64 = data.filter(r=>r.N===n&&r.d===64).sort((a,b)=>b.gflops-a.gflops)[0];
-  const best128 = data.filter(r=>r.N===n&&r.d===128).sort((a,b)=>b.gflops-a.gflops)[0];
-  html += `<td class="best">${best64?labels[best64.kernel]:'—'}</td><td class="best">${best64?best64.gflops.toFixed(0):'—'}</td>`;
-  html += `<td class="best">${best128?labels[best128.kernel]:'—'}</td><td class="best">${best128?best128.gflops.toFixed(0):'—'}</td>`;
-});
-html += '</tr>';
 
 html += '</tbody></table>';
 document.getElementById('table').innerHTML = html;

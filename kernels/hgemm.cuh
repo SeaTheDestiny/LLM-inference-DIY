@@ -381,11 +381,28 @@ __global__ void __launch_bounds__(WARP_SIZE * kNumWarpsA)
 template <const int kBM = 128, const int kBN = 128,
           const int kWarpsM = 2, const int kWarpsN = 4,
           const int kMmaPerM = 4, const int kMmaPerN = 4,
-          const int kWarpK = 2>   // 2 K tiles in registers
+          const int kWarpK = 2,        // 2 K tiles in registers
+          const bool kSwizzleA = false> // SMEM swizzle for A
 __global__ void __launch_bounds__(WARP_SIZE * kWarpsM * kWarpsN)
     hgemm_final_kernel(half *A, half *B, half *C,
                        int M, int N, int K) {
     constexpr int BK = 16;
+    constexpr int kNumWarps = kWarpsM * kWarpsN;
+    constexpr int kStage = 2;
+    constexpr int A_cols = BK * kWarpK;  // 32
+
+    // SMEM swizzle: permute column within each 16-col K-tile to avoid bank conflicts
+    // Applies to both K tiles (cols 0..15 and 16..31 independently)
+    static __device__ __forceinline__ int swizzle_j(int i, int j) {
+        if constexpr (kSwizzleA) {
+            int ktile_base = (j / 16) * 16;           // 0 or 16
+            int local_j = j - ktile_base;              // 0..15
+            int group = (local_j >> 3) ^ ((i >> 2) & 1); // XOR group-id with row/4
+            return ktile_base + (group << 3) + (local_j & 7);
+        } else {
+            return j;
+        }
+    }
     constexpr int kNumWarps = kWarpsM * kWarpsN;
     constexpr int kStage = 2;
 

@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="LLM_DIY - 极速 CUDA Flash Decoding 大模型自研前向推理网页对话框架">
+    <title>LLM_DIY - 极致 CUDA 推理对话终端</title>
+    <!-- Import Modern Premium Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    
+    <style>
+        /* Modern Design System & CSS Variables */
+        :root {
+            --bg-gradient: linear-gradient(135deg, #0b0c16 0%, #050508 100%);
+            --glass-bg: rgba(17, 18, 30, 0.45);
+            --glass-border: rgba(255, 255, 255, 0.05);
+            --glow-cyan: rgba(6, 214, 160, 0.7);
+            --glow-purple: rgba(114, 9, 183, 0.7);
+            --neon-blue: #4cc9f0;
+            --neon-purple: #7209b7;
+            --text-primary: #f8f9fa;
+            --text-secondary: #a0aec0;
+            --font-family: 'Outfit', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: var(--font-family);
+            background: var(--bg-gradient);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+
+        /* Breathtaking Background Ambient Glows */
+        .ambient-glow-1 {
+            position: absolute;
+            top: -20%;
+            left: -10%;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--glow-purple) 0%, rgba(0,0,0,0) 70%);
+            z-index: 0;
+            filter: blur(100px);
+            opacity: 0.4;
+            pointer-events: none;
+            animation: slow-float 20s infinite alternate;
+        }
+
+        .ambient-glow-2 {
+            position: absolute;
+            bottom: -20%;
+            right: -10%;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, var(--glow-cyan) 0%, rgba(0,0,0,0) 70%);
+            z-index: 0;
+            filter: blur(100px);
+            opacity: 0.3;
+            pointer-events: none;
+            animation: slow-float 25s infinite alternate-reverse;
+        }
+
+        @keyframes slow-float {
+            0% { transform: translateY(0) scale(1); }
+            100% { transform: translateY(50px) scale(1.1); }
+        }
+
+        /* Glassmorphic Container Layout */
+        .app-container {
+            position: relative;
+            z-index: 10;
+            width: 95vw;
+            max-width: 1100px;
+            height: 90vh;
+            background: var(--glass-bg);
+            backdrop-filter: blur(25px);
+            -webkit-backdrop-filter: blur(25px);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            animation: fade-in 0.8s ease-out;
+        }
+
+        @keyframes fade-in {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Glass Header Section */
+        .app-header {
+            padding: 20px 30px;
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--glass-border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--neon-blue), var(--neon-purple));
+            border-radius: 10px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            box-shadow: 0 0 15px rgba(76, 201, 240, 0.4);
+            animation: logo-glow 3s infinite alternate;
+        }
+
+        @keyframes logo-glow {
+            from { box-shadow: 0 0 10px rgba(76, 201, 240, 0.4); }
+            to { box-shadow: 0 0 25px rgba(114, 9, 183, 0.7); }
+        }
+
+        .logo-title {
+            font-size: 1.4rem;
+            font-weight: 700;
+            letter-spacing: 1px;
+            background: linear-gradient(to right, #ffffff, var(--neon-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .engine-badge {
+            background: rgba(6, 214, 160, 0.15);
+            border: 1px solid rgba(6, 214, 160, 0.3);
+            color: #06d6a0;
+            padding: 6px 14px;
+            border-radius: 30px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .badge-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #06d6a0;
+            border-radius: 50%;
+            box-shadow: 0 0 8px #06d6a0;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.3); opacity: 0.5; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+
+        /* Chat History Section */
+        .chat-body {
+            flex: 1;
+            padding: 30px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+        }
+
+        .chat-body::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .chat-body::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+        }
+
+        /* Message Bubble Styling with Premium Aesthetics */
+        .message {
+            max-width: 80%;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            animation: message-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+            opacity: 0;
+            transform: translateY(10px);
+        }
+
+        @keyframes message-in {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message.user {
+            align-self: flex-end;
+        }
+
+        .message.assistant {
+            align-self: flex-start;
+        }
+
+        .message-bubble {
+            padding: 16px 20px;
+            border-radius: 20px;
+            font-size: 1.02rem;
+            line-height: 1.6;
+            word-wrap: break-word;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .message.user .message-bubble {
+            background: linear-gradient(135deg, rgba(76, 201, 240, 0.25) 0%, rgba(114, 9, 183, 0.25) 100%);
+            border: 1px solid rgba(76, 201, 240, 0.25);
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant .message-bubble {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-bottom-left-radius: 4px;
+        }
+
+        .message-info {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .message.user .message-info {
+            align-self: flex-end;
+        }
+
+        .message.assistant .message-info {
+            align-self: flex-start;
+        }
+
+        /* Markdown Codeblock styling inside assistant bubble */
+        .message-bubble pre {
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            padding: 14px;
+            margin: 10px 0;
+            overflow-x: auto;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+        }
+
+        .message-bubble code {
+            font-family: var(--font-mono);
+            background: rgba(255, 255, 255, 0.08);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9rem;
+        }
+
+        .message-bubble pre code {
+            background: transparent;
+            padding: 0;
+        }
+
+        /* Typing Indicator / Loader Bubble */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            background-color: var(--text-secondary);
+            border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+
+        .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+        .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1.0); }
+        }
+
+        /* Glass Input Section */
+        .chat-footer {
+            padding: 24px 30px;
+            background: rgba(255, 255, 255, 0.01);
+            border-top: 1px solid var(--glass-border);
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }
+
+        .input-wrapper {
+            flex: 1;
+            position: relative;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+
+        .input-wrapper:focus-within {
+            border-color: rgba(76, 201, 240, 0.5);
+            box-shadow: 0 0 15px rgba(76, 201, 240, 0.15);
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .chat-input {
+            width: 100%;
+            background: transparent;
+            border: none;
+            outline: none;
+            padding: 16px 20px;
+            font-family: var(--font-family);
+            font-size: 1.05rem;
+            color: var(--text-primary);
+            resize: none;
+            max-height: 120px;
+            height: 54px;
+            scrollbar-width: none;
+        }
+
+        .chat-input::-webkit-scrollbar {
+            display: none;
+        }
+
+        /* Sleek Control Buttons */
+        .btn-action {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--glass-border);
+            width: 50px;
+            height: 50px;
+            border-radius: 14px;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: var(--text-secondary);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .btn-action:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.08);
+            transform: scale(1.05);
+        }
+
+        .btn-send {
+            background: linear-gradient(135deg, var(--neon-blue), var(--neon-purple));
+            color: white;
+            border: none;
+            box-shadow: 0 5px 15px rgba(76, 201, 240, 0.3);
+        }
+
+        .btn-send:hover {
+            box-shadow: 0 5px 20px rgba(114, 9, 183, 0.5);
+            transform: scale(1.05) translateY(-2px);
+        }
+
+        .btn-send:active {
+            transform: scale(0.95);
+        }
+
+        .btn-send svg {
+            width: 20px;
+            height: 20px;
+            fill: white;
+            transition: transform 0.3s ease;
+        }
+
+        .btn-send:hover svg {
+            transform: translate(2px, -2px) scale(1.1);
+        }
+
+        .system-prompt {
+            text-align: center;
+            font-size: 0.8rem;
+            color: rgba(255, 255, 255, 0.2);
+            padding: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="ambient-glow-1"></div>
+    <div class="ambient-glow-2"></div>
+    
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-logo">
+                <div class="logo-icon">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 17L12 22L22 17" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 12L12 17L22 12" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div>
+                    <h1 class="logo-title">LLM_DIY</h1>
+                    <p style="font-size: 0.75rem; color: var(--text-secondary); font-weight: 300;">Qwen-1.8B · Flash Decoding v5</p>
+                </div>
+            </div>
+            
+            <div class="engine-badge">
+                <span class="badge-dot"></span>
+                <span>CUDA GPU Engine Active</span>
+            </div>
+        </header>
+
+        <!-- Chat History -->
+        <main class="chat-body" id="chatBody">
+            <!-- Initial Greetings -->
+            <div class="message assistant">
+                <div class="message-bubble">
+                    你好！我是自研 CUDA 推理后端驱动的 <strong>Qwen-1.8B-Chat</strong> 助手。🚀
+                    <br><br>
+                    我目前由你刚才编译的 <code>qwen_infer.exe</code> 直接驱动，并使用我们在 <code>kernels/</code> 文件夹中编写的 **Flash Decoding v5 极速解码算子** 进行自回归推理生成！
+                    <br><br>
+                    来体验一下由物理算力打满、零延迟流式渲染的自研大模型前向推理的魅力吧！请问有什么我可以帮你的？
+                </div>
+                <div class="message-info">Qwen-Inference · 刚刚</div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="chat-footer">
+            <button class="btn-action" id="btnReset" title="清空对话 & 重置缓存" id="btnReset">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                    <path d="M3 3v5h5"/>
+                </svg>
+            </button>
+            
+            <div class="input-wrapper">
+                <textarea class="chat-input" id="chatInput" placeholder="输入消息，Shift + Enter 换行..." rows="1"></textarea>
+            </div>
+            
+            <button class="btn-action btn-send" id="btnSend" title="发送 (Enter)">
+                <svg viewBox="0 0 24 24">
+                    <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                </svg>
+            </button>
+        </footer>
+        
+        <div class="system-prompt">
+            CUDA Driver: sm_89 (RTX 4060 Ti) · Dynamic KV Cache Mode · Direct IO Loader
+        </div>
+    </div>
+
+    <!-- Frontend Interactive Logic & SSE Streamer -->
+    <script>
+        const chatBody = document.getElementById("chatBody");
+        const chatInput = document.getElementById("chatInput");
+        const btnSend = document.getElementById("btnSend");
+        const btnReset = document.getElementById("btnReset");
+
+        // Maintain full conversation context history
+        let chatMessages = [];
+
+        // Scroll to bottom helper
+        function scrollToBottom() {
+            chatBody.scrollTop = chatBody.scrollHeight;
+        }
+
+        // Create HTML template for message bubble
+        function appendMessage(role, text) {
+            const msgDiv = document.createElement("div");
+            msgDiv.classList.add("message", role);
+            
+            const bubbleDiv = document.createElement("div");
+            bubbleDiv.classList.add("message-bubble");
+            
+            // Format rendering: simple markdown codeblock highlights
+            bubbleDiv.innerHTML = formatText(text);
+            
+            const infoDiv = document.createElement("div");
+            infoDiv.classList.add("message-info");
+            infoDiv.innerText = role === "user" ? "你" : "Qwen-Inference";
+            
+            msgDiv.appendChild(bubbleDiv);
+            msgDiv.appendChild(infoDiv);
+            chatBody.appendChild(msgDiv);
+            scrollToBottom();
+            
+            return bubbleDiv;
+        }
+
+        // Lightweight text formatter supporting code blocks
+        function formatText(text) {
+            // Escape html tags to avoid injections
+            let clean = text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+                
+            // Code Blocks formatting
+            clean = clean.replace(/```([\s\S]*?)```/g, (match, code) => {
+                return `<pre><code>${code.trim()}</code></pre>`;
+            });
+            
+            // Inline code formatting
+            clean = clean.replace(/`([^`]+)`/g, "<code>$1</code>");
+            
+            // Line break formatting
+            return clean.replace(/\n/g, "<br>");
+        }
+
+        // Dynamic height adjustment for input textarea
+        chatInput.addEventListener("input", function() {
+            this.style.height = "auto";
+            this.style.height = (this.scrollHeight) + "px";
+        });
+
+        // Trigger message submission
+        async function sendMessage() {
+            const prompt = chatInput.value.trim();
+            if (!prompt) return;
+
+            // Clear input & reset height
+            chatInput.value = "";
+            chatInput.style.height = "54px";
+            
+            // Add user message to UI and messages context
+            appendMessage("user", prompt);
+            chatMessages.push({ role: "user", content: prompt });
+
+            // Create placeholder bubble for assistant response
+            const assistantBubble = appendMessage("assistant", "");
+            
+            // Show Typing indicator dots
+            const typingIndicator = document.createElement("div");
+            typingIndicator.classList.add("typing-indicator");
+            typingIndicator.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
+            assistantBubble.appendChild(typingIndicator);
+            scrollToBottom();
+
+            let assistantResponse = "";
+
+            try {
+                // Post prompt to Flask backend and handle streaming response
+                const response = await fetch("/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ messages: chatMessages })
+                });
+
+                if (!response.ok) {
+                    throw new Error("HTTP error " + response.status);
+                }
+
+                // Remove typing indicator when response starts streaming
+                assistantBubble.innerHTML = "";
+
+                // Stream tokens via SSE Reader
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n\n");
+                    buffer = lines.pop(); // Keep last incomplete line
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            const dataStr = line.slice(6);
+                            if (dataStr === "[DONE]") {
+                                break;
+                            }
+                            try {
+                                const parsed = JSON.parse(dataStr);
+                                assistantResponse += parsed.text;
+                                assistantBubble.innerHTML = formatText(assistantResponse);
+                                scrollToBottom();
+                            } catch (e) {
+                                // Keep going on parse errors
+                            }
+                        }
+                    }
+                }
+                
+                // Add final completed assistant response to messages context
+                chatMessages.push({ role: "assistant", content: assistantResponse });
+
+            } catch (error) {
+                console.error("Inference Streaming failed:", error);
+                assistantBubble.innerHTML = `<span style="color: #ff5555;">[CUDA INFERENCE ERROR] 执行前向传播算子超时或显存加载异常。请检查后台终端日志或重新编译。</span>`;
+            }
+        }
+
+        // Submit trigger binds
+        btnSend.addEventListener("click", sendMessage);
+        chatInput.addEventListener("keydown", function(e) {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        // Reset conversation
+        btnReset.addEventListener("click", function() {
+            chatMessages = [];
+            chatBody.innerHTML = `
+                <div class="message assistant">
+                    <div class="message-bubble">
+                        对话上下文与 GPU KV Cache 已完全重置并清空。🧹
+                        <br><br>
+                        我们可以随时开启新一轮的超低延迟生成对话！请输入你的新问题。
+                    </div>
+                    <div class="message-info">Qwen-Inference · 刚刚</div>
+                </div>
+            `;
+            scrollToBottom();
+        });
+    </script>
+</body>
+</html>

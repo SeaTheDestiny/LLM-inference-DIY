@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Flash Decoding Optimization Results</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+        h1 { color: #00d2ff; text-align: center; }
+        h2 { color: #7b68ee; margin-top: 40px; }
+        .chart-container { width: 90%; max-width: 1000px; margin: 20px auto; background: #16213e; border-radius: 12px; padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+        textarea { width: 90%; max-width: 1000px; margin: 10px auto; display: block; height: 120px; background: #0f3460; color: #e0e0e0; border: 1px solid #7b68ee; border-radius: 8px; padding: 10px; font-family: monospace; }
+        button { display: block; margin: 10px auto; padding: 10px 30px; background: #7b68ee; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #6a5acd; }
+        .note { text-align: center; color: #888; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h1>⚡ Flash Decoding Optimization Results</h1>
+    <p class="note">Paste CSV output from bench_fd_opt below, then click "Render"</p>
+
+    <textarea id="csvInput" placeholder="kernel,KV_seqlen,d,time_ms,bandwidth_gbs
+baseline,256,128,0.0123,45.67
+fd_naive,256,128,0.0089,62.34
+...">kernel,KV_seqlen,d,time_ms,bandwidth_gbs
+baseline,256,128,0.0960,1.37
+fd_naive,256,128,0.0155,8.50
+fd_v1_coalesced,256,128,0.0092,14.28
+fd_v2_largechunk,256,128,0.0328,4.02
+fd_v3_multiwarp,256,128,0.0144,9.16
+fd_v4_final,256,128,0.0153,8.62
+fd_v5_fused,256,128,0.0133,9.88
+fd_v5_split,256,128,0.0153,8.60
+fa_final,256,128,0.0215,6.12
+baseline,512,128,0.1865,1.41
+fd_naive,512,128,0.0174,15.09
+fd_v1_coalesced,512,128,0.0095,27.73
+fd_v2_largechunk,512,128,0.0328,8.02
+fd_v3_multiwarp,512,128,0.0143,18.32
+fd_v4_final,512,128,0.0144,18.28
+fd_v5_fused,512,128,0.0143,18.40
+fd_v5_split,512,128,0.0147,17.92
+fa_final,512,128,0.0345,7.62
+baseline,1024,128,0.5335,0.98
+fd_naive,1024,128,0.0246,21.35
+fd_v1_coalesced,1024,128,0.0113,46.59
+fd_v2_largechunk,1024,128,0.0330,15.89
+fd_v3_multiwarp,1024,128,0.0154,34.17
+fd_v4_final,1024,128,0.0150,34.89
+fd_v5_fused,1024,128,0.0154,34.17
+fd_v5_split,1024,128,0.0143,36.61
+fa_final,1024,128,0.0605,8.67
+baseline,2048,128,0.7353,1.43
+fd_naive,2048,128,0.0358,29.27
+fd_v1_coalesced,2048,128,0.0137,76.60
+fd_v2_largechunk,2048,128,0.0338,31.05
+fd_v3_multiwarp,2048,128,0.0155,67.88
+fd_v4_final,2048,128,0.0143,73.18
+fd_v5_split,2048,128,0.0150,69.75
+fa_final,2048,128,0.1137,9.23
+baseline,4096,128,2.0664,1.02
+fd_naive,4096,128,0.0594,35.32
+fd_v1_coalesced,4096,128,0.0193,108.89
+fd_v2_largechunk,4096,128,0.0348,60.36
+fd_v3_multiwarp,4096,128,0.0164,128.03
+fd_v4_final,4096,128,0.0154,136.00
+fd_v5_split,4096,128,0.0154,136.57
+fa_final,4096,128,0.2191,9.57
+baseline,8192,128,3.8359,1.09
+fd_naive,8192,128,0.1106,37.93
+fd_v1_coalesced,8192,128,0.0307,136.55
+fd_v2_largechunk,8192,128,0.0355,118.20
+fd_v3_multiwarp,8192,128,0.0177,237.48
+fd_v4_final,8192,128,0.0164,256.53
+fd_v5_split,8192,128,0.0164,256.53
+fa_final,8192,128,0.4326,9.70</textarea>
+
+    <button onclick="renderCharts()">📊 Render Charts</button>
+
+    <h2>Latency vs KV_seqlen</h2>
+    <div class="chart-container"><canvas id="latencyChart"></canvas></div>
+
+    <h2>Effective Bandwidth (GB/s) vs KV_seqlen</h2>
+    <div class="chart-container"><canvas id="bwChart"></canvas></div>
+
+    <h2>Speedup over Baseline</h2>
+    <div class="chart-container"><canvas id="speedupChart"></canvas></div>
+
+<script>
+const COLORS = {
+    'baseline':         '#ff6384',
+    'fd_naive':         '#ff9f40',
+    'fd_v1_coalesced':  '#ffcd56',
+    'fd_v2_largechunk': '#4bc0c0',
+    'fd_v3_multiwarp':  '#36a2eb',
+    'fd_v4_final':      '#9966ff',
+    'fd_v5_fused':      '#00ffcc',
+    'fd_v5_split':      '#ff00ff',
+    'fa_final':         '#c9cbcf',
+};
+
+let charts = {};
+
+function parseCSV(text) {
+    const lines = text.trim().split('\n');
+    const header = lines[0].split(',');
+    return lines.slice(1).filter(l => l.trim()).map(line => {
+        const vals = line.split(',');
+        return {
+            kernel: vals[0].trim(),
+            KV: parseInt(vals[1]),
+            d: parseInt(vals[2]),
+            time_ms: parseFloat(vals[3]),
+            bw: parseFloat(vals[4]),
+        };
+    });
+}
+
+function renderCharts() {
+    const data = parseCSV(document.getElementById('csvInput').value);
+    const kernels = [...new Set(data.map(d => d.kernel))];
+    const kvs = [...new Set(data.map(d => d.KV))].sort((a,b) => a-b);
+
+    // Get baseline times for speedup
+    const baselineTimes = {};
+    data.filter(d => d.kernel === 'baseline').forEach(d => baselineTimes[d.KV] = d.time_ms);
+
+    // Latency chart
+    if (charts.latency) charts.latency.destroy();
+    charts.latency = new Chart(document.getElementById('latencyChart'), {
+        type: 'line',
+        data: {
+            labels: kvs.map(String),
+            datasets: kernels.map(k => ({
+                label: k,
+                data: kvs.map(kv => {
+                    const row = data.find(d => d.kernel === k && d.KV === kv);
+                    return row ? row.time_ms : null;
+                }),
+                borderColor: COLORS[k] || '#888',
+                backgroundColor: (COLORS[k] || '#888') + '33',
+                borderWidth: 2, tension: 0.3, pointRadius: 4,
+            }))
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Latency (ms) — lower is better', color: '#e0e0e0', font: {size:16} },
+                        legend: { labels: { color: '#e0e0e0' } } },
+            scales: {
+                x: { title: { display: true, text: 'KV_seqlen', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } },
+                y: { type: 'logarithmic', title: { display: true, text: 'Time (ms)', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } }
+            }
+        }
+    });
+
+    // Bandwidth chart
+    if (charts.bw) charts.bw.destroy();
+    charts.bw = new Chart(document.getElementById('bwChart'), {
+        type: 'bar',
+        data: {
+            labels: kvs.map(String),
+            datasets: kernels.map(k => ({
+                label: k,
+                data: kvs.map(kv => {
+                    const row = data.find(d => d.kernel === k && d.KV === kv);
+                    return row ? row.bw : null;
+                }),
+                backgroundColor: COLORS[k] || '#888',
+                borderColor: (COLORS[k] || '#888'),
+                borderWidth: 1,
+            }))
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Effective Bandwidth (GB/s) — higher is better', color: '#e0e0e0', font: {size:16} },
+                        legend: { labels: { color: '#e0e0e0' } } },
+            scales: {
+                x: { title: { display: true, text: 'KV_seqlen', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } },
+                y: { title: { display: true, text: 'GB/s', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } }
+            }
+        }
+    });
+
+    // Speedup chart
+    if (charts.speedup) charts.speedup.destroy();
+    charts.speedup = new Chart(document.getElementById('speedupChart'), {
+        type: 'line',
+        data: {
+            labels: kvs.map(String),
+            datasets: kernels.filter(k => k !== 'baseline').map(k => ({
+                label: k,
+                data: kvs.map(kv => {
+                    const row = data.find(d => d.kernel === k && d.KV === kv);
+                    const bt = baselineTimes[kv];
+                    return (row && bt) ? (bt / row.time_ms) : null;
+                }),
+                borderColor: COLORS[k] || '#888',
+                borderWidth: 2, tension: 0.3, pointRadius: 4,
+            }))
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: 'Speedup over Baseline — higher is better', color: '#e0e0e0', font: {size:16} },
+                        legend: { labels: { color: '#e0e0e0' } } },
+            scales: {
+                x: { title: { display: true, text: 'KV_seqlen', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } },
+                y: { title: { display: true, text: 'Speedup×', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } }
+            }
+        }
+    });
+}
+
+// Auto-render with placeholder data
+window.onload = renderCharts;
+</script>
+</body>
+</html>

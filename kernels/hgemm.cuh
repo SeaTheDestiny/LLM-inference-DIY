@@ -366,3 +366,292 @@ __global__ void __launch_bounds__(WARP_SIZE * kNumWarpsA)
             LDST32BITS(C[gr8 * N + gc0]) = LDST32BITS(RC[n][1]);
     }
 }
+
+
+// ============================================================
+// Final HGEMM: 2×4 warp grid, K32 register double buffer, SMEM swizzle
+// ============================================================
+// BM=128, BN=128, 8 warps (2 M × 4 N), 256 threads
+// Key optimizations from reference:
+//   1. WARP_TILE_K=2: load 2 BK tiles into SMEM, double-buffer RA/RB in regs
+//   2. SMEM swizzle: bank conflict avoidance for A ldmatrix
+//   3. Warp shuffle collective store: 128-bit vectorized write
+//   4. 2D warp grid: split both M and N dimensions
+
+template <const int kBM = 128, const int kBN = 128,
+          const int kWarpsM = 2, const int kWarpsN = 4,
+          const int kMmaPerM = 4, const int kMmaPerN = 4,
+          const int kWarpK = 2>   // 2 K tiles in registers
+__global__ void __launch_bounds__(WARP_SIZE * kWarpsM * kWarpsN)
+    hgemm_final_kernel(half *A, half *B, half *C,
+                       int M, int N, int K) {
+    constexpr int BK = 16;
+    constexpr int kNumWarps = kWarpsM * kWarpsN;
+    constexpr int kStage = 2;
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int num_k_tiles = (K + BK * kWarpK - 1) / (BK * kWarpK);
+
+    int tid = threadIdx.x;
+    int lid = tid % WARP_SIZE;
+    int wid = tid / WARP_SIZE;
+    int wM  = wid % kWarpsM;          // 0,1
+    int wN  = wid / kWarpsM;          // 0,1,2,3
+
+    int gM = by * kBM + wM * (16 * kMmaPerM);  // warp's M start
+    int gN = bx * kBN + wN * (8 * kMmaPerN);   // warp's N start
+    if (gM >= M || gN >= N) return;
+
+    // SMEM with swizzle-friendly layout
+    // layout: [kStage][kBM][BK*kWarpK + PAD]
+    constexpr int A_cols = BK * kWarpK;         // 32
+    constexpr int A_sz = kBM * A_cols;           // 128×32 = 4096 per stage
+    constexpr int B_sz = BK * kWarpK * kBN;      // 32×128 = 4096 per stage
+    extern __shared__ half smem[];
+    half *s_a = smem;
+    half *s_b = smem + kStage * A_sz;
+    uint32_t a_base = __cvta_generic_to_shared(s_a);
+    uint32_t b_base = __cvta_generic_to_shared(s_b);
+
+    // A load: [128][32], 256 threads, each loads 8 halfs (float2)
+    auto ldA_r = tid / 4;           // 0..63 (thread 0-3:row0, 4-7:row1, etc.)
+    auto ldA_c = (tid % 4) * 8;     // 0,8,16,24
+    // Wait, that gives 128 entries (256 threads / 2). 128×8 = 1024, but A_sz = 4096.
+    // Need 4x more. Each thread loads 16 halfs (float4) instead.
+    auto ldA_r2 = tid % 128;        // 0..127 (each row needs 32 cols = 4×8 halfs)
+    auto ldA_c2 = (tid / 128) * 8;  // 0 for tid 0..127, 8 for 128..255
+    // 256 threads × 16 halfs = 4096 halfs ✓
+
+    // B load: [32][128], 256 threads, each loads 16 halfs
+    auto ldB_r = tid / 16;          // 0..15 (B rows, but need 32 → 2 rounds)
+    auto ldB_c = (tid % 16) * 8;    // 0,8,16,...120
+    // Only 16 rows covered, need 2× coverage.
+    // With 256 threads, each loading 16 halfs = 4096 ✓ if we cover 32 rows.
+    // But ldB_r only gives 16. Need: ldB_r = tid/8 gives 32 rows, ldB_c = (tid%8)*8
+    auto ldB_r2 = tid / 8;          // 0..31
+    auto ldB_c2 = (tid % 8) * 8;    // 0,8,16,...,56
+    // 256 threads × 16 halfs = 4096 ✓. Rows 0..31, cols 0..56+8=64. But BN=128!
+    // Still only 64 cols. Need to load 128 cols with 256 threads:
+    // ldB_r: row = tid/16 (0..15), col = (tid%16)*8 (0..120). That's 16 rows × 128 cols.
+    // For 32 rows, do 2 passes or use 2 threads per row.
+    // Simpler: each thread loads float2 (4 halfs), ldB_r = tid/32 (0..7 rows? No.)
+    
+    // Actually, for B[32][128] = 4096 halfs = 256 float4. 256 threads × 1 float4 = 256 float4.
+    // Wait: 4096/8 = 512 float4. With 256 threads, each loads 2 float4 = 16 halfs.
+    // ldB_r = tid % 32 (0..31), ldB_c = (tid / 32) * 16 (0,16,32,...,112)
+    // 31*128 + 112 = 4088, covers B[32][128].
+    // Hmm, tid/32 gives 0..7. (tid/32)*16 gives 0,16,32,...,112. That's 8 cols per row per thread = 16 halfs.
+    // 32 rows × 8 threads each = 256. ✓
+
+    // Actually let me just use the simple direct mapping from the reference.
+    // The reference uses simple float4 loads for A and B with appropriate thread mapping.
+    // For A[128][32]: 4096 halfs = 512 float4. 256 threads × 2 float4 each.
+    // Thread t: row = t % 64, col = (t/64) * 8. Wait, that gives 64 rows and 4 cols.
+    // t % 128 gives row 0..127. t/128 gives 0 or 1, each loading 8 halfs at col 0 or 16.
+    // Need col 0,8,16,24 = 4 positions. t%128 for rows, t/128 only gives 2 positions.
+    // 
+    // Simpler: each thread loads 16 halfs (2 float4). A[128][32] has 128 rows × 32 cols.
+    // thread t loads row r = t%128, col c = (t/128)*16 (0 or 16). That covers 128 rows × 16+8 = 24 cols.
+    // Still missing cols 24..31. Need 3 way split.
+    //
+    // OK, let me just use the reference's mapping for simplicity.
+    // Reference: load_smem_a_m = tid / 2 (0..127), load_smem_a_k = (tid%2)*8 (0,8)
+    // That loads A[128][8+8=16] with 256 threads → only covers 16 cols!
+    // But the reference loads 2 K tiles separately (WARP_TILE_K=2), each is BK=16.
+    // So it loads 2 separate A tiles: one at offset 0, one at offset 16.
+    
+    // Let me use the same approach:
+    // A_load_0: row=tid/2 (0..127), col=(tid%2)*8 (0,8) → covers A[128][16] for K tile 0
+    // A_load_1: row=tid/2, col=(tid%2)*8 → covers A[128][16] for K tile 1 (offset +16 in smem)
+    
+    // For B:
+    // B_load_0: row=tid/16 (0..15), col=(tid%16)*8 (0..120) → B[16][128] for K tile 0
+    // B_load_1: row=tid/16, col=(tid%16)*8 → B[16][128] for K tile 1 (offset +16 in smem)
+
+    // RC: per-warp accumulation [kMmaPerM][kMmaPerN][2]
+    uint32_t RC[kMmaPerM][kMmaPerN][2];
+    #pragma unroll
+    for (int i = 0; i < kMmaPerM; i++)
+        #pragma unroll
+        for (int j = 0; j < kMmaPerN; j++)
+            { RC[i][j][0] = 0; RC[i][j][1] = 0; }
+
+    // Registers for double-buffered A and B fragments
+    uint32_t RA[2][kMmaPerM][4];  // [buffer][mma_m][4]
+    uint32_t RB[2][kMmaPerN][2];  // [buffer][mma_n][2]
+    int buf_store = 0, buf_load = 1;
+
+    // Prefetch first K double-tile (k=0)
+    {
+        int gK = 0 + (tid % 2) * 8;
+        int g_addr = (by * kBM + tid / 2) * K + gK;
+        if (by * kBM + tid / 2 < M && gK < K) {
+            uint32_t sp = a_base + (0 * A_sz + (tid / 2) * A_cols + (tid % 2) * 8) * sizeof(half);
+            CP_ASYNC_CG(sp, &A[g_addr], 16);
+        }
+        // Second K tile in smem
+        if (by * kBM + tid / 2 < M && gK + 16 < K) {
+            uint32_t sp = a_base + (0 * A_sz + (tid / 2) * A_cols + (tid % 2) * 8 + 16) * sizeof(half);
+            CP_ASYNC_CG(sp, &A[g_addr + 16], 16);
+        }
+
+        gK = 0 + tid / 16;
+        g_addr = gK * N + bx * kBN + (tid % 16) * 8;
+        if (gK < K && bx * kBN + (tid % 16) * 8 < N) {
+            uint32_t sp = b_base + (0 * B_sz + (tid / 16) * kBN + (tid % 16) * 8) * sizeof(half);
+            CP_ASYNC_CG(sp, &B[g_addr], 16);
+        }
+        if (gK + 16 < K && bx * kBN + (tid % 16) * 8 < N) {
+            uint32_t sp = b_base + (0 * B_sz + (tid / 16 + 16) * kBN + (tid % 16) * 8) * sizeof(half);
+            CP_ASYNC_CG(sp, &B[(gK + 16) * N + bx * kBN + (tid % 16) * 8], 16);
+        }
+        CP_ASYNC_COMMIT_GROUP();
+        CP_ASYNC_WAIT_GROUP(0);
+        __syncthreads();
+    }
+
+    // Load first register buffer
+    #pragma unroll
+    for (int i = 0; i < kMmaPerM; i++) {
+        int a_row = lid % 16, a_col = (lid / 16) * 8;
+        uint32_t ap = a_base + ((wM * kMmaPerM + i) * 16 + a_row) * A_cols * sizeof(half) + a_col * sizeof(half);
+        LDMATRIX_X4(RA[buf_store][i][0], RA[buf_store][i][1],
+                    RA[buf_store][i][2], RA[buf_store][i][3], ap);
+    }
+    #pragma unroll
+    for (int j = 0; j < kMmaPerN; j++) {
+        int b_row = lid % 16, b_col = (wN * kMmaPerN + j) * 8;
+        uint32_t bp = b_base + (b_row * kBN + b_col) * sizeof(half);
+        LDMATRIX_X2_T(RB[buf_store][j][0], RB[buf_store][j][1], bp);
+    }
+
+    // Main K loop
+    #pragma unroll 1
+    for (int kt = 0; kt < num_k_tiles; ++kt) {
+        buf_store ^= 1; buf_load ^= 1;
+        int stg = kt % kStage, nxt = (kt + 1) % kStage;
+
+        // Prefetch next K double-tile
+        if (kt + 1 < num_k_tiles) {
+            int nK = (kt + 1) * BK * kWarpK + (tid % 2) * 8;
+            int g_addr = (by * kBM + tid / 2) * K + nK;
+            if (by * kBM + tid / 2 < M && nK < K) {
+                uint32_t sp = a_base + (nxt * A_sz + (tid / 2) * A_cols + (tid % 2) * 8) * sizeof(half);
+                CP_ASYNC_CG(sp, &A[g_addr], 16);
+            }
+            if (by * kBM + tid / 2 < M && nK + 16 < K) {
+                uint32_t sp = a_base + (nxt * A_sz + (tid / 2) * A_cols + (tid % 2) * 8 + 16) * sizeof(half);
+                CP_ASYNC_CG(sp, &A[g_addr + 16], 16);
+            }
+
+            nK = (kt + 1) * BK * kWarpK + tid / 16;
+            g_addr = nK * N + bx * kBN + (tid % 16) * 8;
+            if (nK < K && bx * kBN + (tid % 16) * 8 < N) {
+                uint32_t sp = b_base + (nxt * B_sz + (tid / 16) * kBN + (tid % 16) * 8) * sizeof(half);
+                CP_ASYNC_CG(sp, &B[g_addr], 16);
+            }
+            if (nK + 16 < K && bx * kBN + (tid % 16) * 8 < N) {
+                uint32_t sp = b_base + (nxt * B_sz + (tid / 16 + 16) * kBN + (tid % 16) * 8) * sizeof(half);
+                CP_ASYNC_CG(sp, &B[(nK + 16) * N + bx * kBN + (tid % 16) * 8], 16);
+            }
+            CP_ASYNC_COMMIT_GROUP();
+        }
+
+        // Load next register buffer (from second K tile in CURRENT SMEM stage)
+        #pragma unroll
+        for (int i = 0; i < kMmaPerM; i++) {
+            int a_row = lid % 16, a_col = (lid / 16) * 8;
+            uint32_t ap = a_base + (stg * A_sz + ((wM * kMmaPerM + i) * 16 + a_row) * A_cols + (a_col + 16)) * sizeof(half);
+            LDMATRIX_X4(RA[buf_store][i][0], RA[buf_store][i][1],
+                        RA[buf_store][i][2], RA[buf_store][i][3], ap);
+        }
+        #pragma unroll
+        for (int j = 0; j < kMmaPerN; j++) {
+            int b_row = lid % 16, b_col = (wN * kMmaPerN + j) * 8;
+            uint32_t bp = b_base + (stg * B_sz + (b_row + 16) * kBN + b_col) * sizeof(half);
+            LDMATRIX_X2_T(RB[buf_store][j][0], RB[buf_store][j][1], bp);
+        }
+
+        // MMA: first K tile (from buf_load, which was loaded in previous iteration)
+        #pragma unroll
+        for (int i = 0; i < kMmaPerM; i++) {
+            #pragma unroll
+            for (int j = 0; j < kMmaPerN; j++) {
+                HMMA16816(RC[i][j][0], RC[i][j][1],
+                          RA[buf_load][i][0], RA[buf_load][i][1],
+                          RA[buf_load][i][2], RA[buf_load][i][3],
+                          RB[buf_load][j][0], RB[buf_load][j][1],
+                          RC[i][j][0], RC[i][j][1]);
+            }
+        }
+
+        buf_store ^= 1; buf_load ^= 1;
+
+        // MMA: second K tile (from buf_load, just loaded above)
+        #pragma unroll
+        for (int i = 0; i < kMmaPerM; i++) {
+            #pragma unroll
+            for (int j = 0; j < kMmaPerN; j++) {
+                HMMA16816(RC[i][j][0], RC[i][j][1],
+                          RA[buf_load][i][0], RA[buf_load][i][1],
+                          RA[buf_load][i][2], RA[buf_load][i][3],
+                          RB[buf_load][j][0], RB[buf_load][j][1],
+                          RC[i][j][0], RC[i][j][1]);
+            }
+        }
+
+        if (kt + 1 < num_k_tiles) {
+            CP_ASYNC_WAIT_GROUP(0);
+            __syncthreads();
+        }
+
+        // Pre-load first K tile of NEXT iteration (from stage just prefetched = nxt)
+        if (kt + 1 < num_k_tiles) {
+            #pragma unroll
+            for (int i = 0; i < kMmaPerM; i++) {
+                int a_row = lid % 16, a_col = (lid / 16) * 8;
+                uint32_t ap = a_base + (nxt * A_sz + ((wM * kMmaPerM + i) * 16 + a_row) * A_cols + a_col) * sizeof(half);
+                LDMATRIX_X4(RA[buf_store][i][0], RA[buf_store][i][1],
+                            RA[buf_store][i][2], RA[buf_store][i][3], ap);
+            }
+            #pragma unroll
+            for (int j = 0; j < kMmaPerN; j++) {
+                int b_row = lid % 16, b_col = (wN * kMmaPerN + j) * 8;
+                uint32_t bp = b_base + (nxt * B_sz + b_row * kBN + b_col) * sizeof(half);
+                LDMATRIX_X2_T(RB[buf_store][j][0], RB[buf_store][j][1], bp);
+            }
+        }
+    }
+
+    // Warp-shuffle collective store (128-bit vectorized)
+    #pragma unroll
+    for (int i = 0; i < kMmaPerM; i++) {
+        // Shuffle RC[..][0] and RC[..][1] across lanes
+        uint32_t Z0[kMmaPerN][4], Z1[kMmaPerN][4];
+        #pragma unroll
+        for (int j = 0; j < kMmaPerN; j++) {
+            Z0[j][0] = RC[i][j][0];
+            Z1[j][0] = RC[i][j][1];
+            Z0[j][1] = __shfl_sync(0xffffffff, RC[i][j][0], lid + 1);
+            Z0[j][2] = __shfl_sync(0xffffffff, RC[i][j][0], lid + 2);
+            Z0[j][3] = __shfl_sync(0xffffffff, RC[i][j][0], lid + 3);
+            Z1[j][1] = __shfl_sync(0xffffffff, RC[i][j][1], lid + 1);
+            Z1[j][2] = __shfl_sync(0xffffffff, RC[i][j][1], lid + 2);
+            Z1[j][3] = __shfl_sync(0xffffffff, RC[i][j][1], lid + 3);
+        }
+
+        if (lid % 4 == 0) {
+            int gr0 = gM + i * 16 + lid / 4;
+            int gr8 = gr0 + 8;
+            #pragma unroll
+            for (int j = 0; j < kMmaPerN; j++) {
+                int gc = gN + j * 8;
+                if (gr0 < M && gc < N)
+                    LDST128BITS(C[gr0 * N + gc]) = LDST128BITS(Z0[j][0]);
+                if (gr8 < M && gc < N)
+                    LDST128BITS(C[gr8 * N + gc]) = LDST128BITS(Z1[j][0]);
+            }
+        }
+    }
+}

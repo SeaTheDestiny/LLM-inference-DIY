@@ -154,6 +154,28 @@ int main(int argc, char **argv) {
         check_err(d_C, "async");
     }
 
+    // === Final (128x128, 2×4 warp grid, K32 reg buffer, shuffle store) ===
+    {
+        num_M_tiles = (M + 127) / 128;
+        num_N_tiles = (N + 127) / 128;
+        dim3 g(num_N_tiles, num_M_tiles);
+        dim3 b(WARP_SIZE * 8);
+        auto fn = hgemm_final_kernel<128, 128, 2, 4, 4, 4, 2>;
+        constexpr int A_sz = 128 * 32, B_sz = 32 * 128;
+        int smem = 2 * (A_sz + B_sz) * sizeof(half);
+        checkCuda(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        cudaMemset(d_C, 0, M*N*sizeof(half));
+        fn<<<g, b, smem>>>(d_A, d_B, d_C, M, N, K);
+        cudaDeviceSynchronize();
+        cudaEventRecord(start);
+        fn<<<g, b, smem>>>(d_A, d_B, d_C, M, N, K);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("final(128x128):%8.3f ms  %6.1f TFLOPS\n", ms, total_tflops/(ms/1000.0));
+        check_err(d_C, "final");
+    }
+
     cublasDestroy(handle);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     free(h_A); free(h_B); free(h_C); free(h_C_ref);

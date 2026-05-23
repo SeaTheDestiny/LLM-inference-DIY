@@ -669,3 +669,294 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     }
 
   }
+
+
+// ============================================================================
+// Step 1: Fine-grained Q/K Tiling
+// ============================================================================
+// 核心改动 vs 原始 multi-warp kernel:
+//   s_q[Br][kHeadDim]  ->  s_q[Br][kMmaAtomK + kPadQ]    (Br*24 代替 Br*128)
+//   s_k[Bc][kHeadDim]  ->  s_k[Bc][kMmaAtomK + kPadQ]    (Bc*24 代替 Bc*128)
+//   Q@K^T 新增外循环 tile_K_d in [0, kHeadDim/kMmaAtomK), 每次加载16列到SMEM
+//   s_p[Br][Bc] / s_v[Bc][kHeadDim] 保持不变 (Step 2/4 再优化)
+//   extern __shared__ 动态分配 SMEM + 8元素padding 避免 bank conflict
+//   SMEM 用量: (Br*24 + Bc*24 + Br*Bc + Bc*d) * 2 bytes
+//   d=128: (1536+1536+4096+8192)*2 = 30720 bytes
+
+template <
+    const int kHeadDim,          // Headdim: 32, 64, 128
+    const int kMmaAtomM = 16,    // MMA Atom M
+    const int kMmaAtomN = 8,     // MMA Atom N
+    const int kMmaAtomK = 16,    // MMA Atom K
+    const int kMmaTileSeqLenQ = 4,    // 4 warps for Q rows
+    const int kMmaTileSeqLenK = 1,    // 1 warp for K cols
+    const int kWarpTileSeqLenQ = 1,   // 1, Br = 16*4*1 = 64
+    const int kWarpTileSeqLenK = 8,   // 8, Bc = 8*1*8 = 64
+    const int kPadQ = 8,              // padding for Q tile
+    const int kPadK = 8               // padding for K tile
+    >
+constexpr int kNumThreads_fg = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
+__global__ void __launch_bounds__(kNumThreads_fg)
+    flash_attn_finegrained_qk_tiling_kernel(half *Q, half *K, half *V,
+                                            half *O, int QKV_seqlen,
+                                            int QKV_head) {
+    constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 64
+    constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;  // 64
+    const int Tc = div_ceil(QKV_seqlen, Bc);
+    const int Tr = blockIdx.y;
+
+    int Q_addr_offset = QKV_head * QKV_seqlen * kHeadDim + Tr * Br * kHeadDim;
+    int K_addr_offset = QKV_head * QKV_seqlen * kHeadDim;
+    int V_addr_offset = QKV_head * QKV_seqlen * kHeadDim;
+    int O_addr_offset = QKV_head * QKV_seqlen * kHeadDim + Tr * Br * kHeadDim;
+
+    // --- extern shared memory layout ---
+    // [Q_tile] [K_tile] [s_p] [s_v]
+    constexpr int Q_tile_size = Br * (kMmaAtomK + kPadQ);   // 64*24 = 1536
+    constexpr int K_tile_size = Bc * (kMmaAtomK + kPadK);   // 64*24 = 1536
+    extern __shared__ half smem[];
+    half *Q_tile_smem = smem;
+    half *K_tile_smem = smem + Q_tile_size;
+    half *s_p          = smem + Q_tile_size + K_tile_size;
+    half *s_v          = smem + Q_tile_size + K_tile_size + Br * Bc;
+
+    uint32_t smem_Q_base = __cvta_generic_to_shared(Q_tile_smem);
+    uint32_t smem_K_base = __cvta_generic_to_shared(K_tile_smem);
+
+    int thread_id = threadIdx.x;
+    int lane_id   = thread_id % WARP_SIZE;
+    int warp_id   = thread_id / WARP_SIZE;
+    int warp_r    = warp_id / kMmaTileSeqLenK;  // Q row warps: 0,1,2,3
+    int warp_c    = warp_id % kMmaTileSeqLenK;  // K col warp:  0
+
+    // --- Register allocation ---
+    uint32_t R_Q[4];
+    uint32_t R_K[2];
+
+    uint32_t R_O[kHeadDim / kMmaAtomN][2];
+    #pragma unroll
+    for (int i = 0; i < kHeadDim / kMmaAtomN; i++) {
+        R_O[i][0] = 0;
+        R_O[i][1] = 0;
+    }
+
+    float row_max[2] = {-INFINITY, -INFINITY};
+    float row_l[2]   = {0.0f, 0.0f};
+
+    float scale = 1.0f / sqrtf((float)kHeadDim);
+    constexpr int kHalfPer128Bit = 8;
+
+    // --- Outer loop over K seqlen tiles ---
+    #pragma unroll 1
+    for (int j = 0; j < Tc; j++) {
+        uint32_t R_S[kWarpTileSeqLenK][2];
+        #pragma unroll
+        for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+            R_S[k_tile][0] = 0;
+            R_S[k_tile][1] = 0;
+        }
+
+        // ============ Fine-grained loop over d (kMmaAtomK=16 at a time) ============
+        #pragma unroll
+        for (int tile_K_d = 0; tile_K_d < kHeadDim / kMmaAtomK; ++tile_K_d) {
+            int global_col_offset = tile_K_d * kMmaAtomK;
+
+            // g(Q) -> s(Q): Br*16 halfs, 128 threads -> 1 float4/thread
+            {
+                int row = thread_id / 2;                       // 0..63
+                int col = (thread_id % 2) * kHalfPer128Bit;   // 0 or 8
+                if (Tr * Br + row < QKV_seqlen) {
+                    LDST128BITS(Q_tile_smem[row * (kMmaAtomK + kPadQ) + col])
+                        = LDST128BITS(Q[Q_addr_offset + row * kHeadDim + global_col_offset + col]);
+                } else {
+                    float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
+                    LDST128BITS(Q_tile_smem[row * (kMmaAtomK + kPadQ) + col]) = zero;
+                }
+            }
+
+            // g(K) -> s(K): Bc*16 halfs, 128 threads -> 1 float4/thread
+            {
+                int row = thread_id / 2;
+                int col = (thread_id % 2) * kHalfPer128Bit;
+                if (j * Bc + row < QKV_seqlen) {
+                    LDST128BITS(K_tile_smem[row * (kMmaAtomK + kPadK) + col])
+                        = LDST128BITS(K[K_addr_offset + j * Bc * kHeadDim + row * kHeadDim + global_col_offset + col]);
+                } else {
+                    float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
+                    LDST128BITS(K_tile_smem[row * (kMmaAtomK + kPadK) + col]) = zero;
+                }
+            }
+            __syncthreads();
+
+            // ---- MMA: Q_tile[Br,16] @ K_tile^T[16,Bc] -> S[Br,Bc] (accumulate) ----
+            int q_row = lane_id % kMmaAtomM + warp_r * kMmaAtomM;
+            int q_col = (lane_id / kMmaAtomM) * 8;  // 0 or 8
+            uint32_t q_addr = smem_Q_base + (q_row * (kMmaAtomK + kPadQ) + q_col) * sizeof(half);
+            LDMATRIX_X4(R_Q[0], R_Q[1], R_Q[2], R_Q[3], q_addr);
+
+            #pragma unroll
+            for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+                int k_row = lane_id % kMmaAtomN + k_tile * kMmaAtomN
+                            + warp_c * kWarpTileSeqLenK * kMmaAtomN;
+                int k_col = ((lane_id / kMmaAtomN) % 2) * 8;  // 0 or 8
+                uint32_t k_addr = smem_K_base + (k_row * (kMmaAtomK + kPadK) + k_col) * sizeof(half);
+                LDMATRIX_X2(R_K[0], R_K[1], k_addr);
+
+                HMMA16816(R_S[k_tile][0], R_S[k_tile][1],
+                          R_Q[0], R_Q[1], R_Q[2], R_Q[3],
+                          R_K[0], R_K[1],
+                          R_S[k_tile][0], R_S[k_tile][1]);
+            }
+            __syncthreads();
+        }  // end loop over tile_K_d
+
+        // ---- Online Safe Softmax (same as original multi-warp) ----
+        float2 f_res[kWarpTileSeqLenK][2];
+        #pragma unroll
+        for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+            f_res[k_tile][0] = __half22float2(HALF2(R_S[k_tile][0]));
+            f_res[k_tile][1] = __half22float2(HALF2(R_S[k_tile][1]));
+
+            f_res[k_tile][0].x *= scale; f_res[k_tile][0].y *= scale;
+            f_res[k_tile][1].x *= scale; f_res[k_tile][1].y *= scale;
+
+            int k_col_x = j * Bc + ((lane_id % 4) * 2 + 0) + k_tile * 8;
+            int k_col_y = j * Bc + ((lane_id % 4) * 2 + 1) + k_tile * 8;
+
+            if (k_col_x >= QKV_seqlen) { f_res[k_tile][0].x = -INFINITY; f_res[k_tile][1].x = -INFINITY; }
+            if (k_col_y >= QKV_seqlen) { f_res[k_tile][0].y = -INFINITY; f_res[k_tile][1].y = -INFINITY; }
+        }
+
+        float m_row_0 = -INFINITY;
+        float m_row_1 = -INFINITY;
+        #pragma unroll
+        for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+            m_row_0 = fmaxf(m_row_0, fmaxf(f_res[k_tile][0].x, f_res[k_tile][0].y));
+            m_row_1 = fmaxf(m_row_1, fmaxf(f_res[k_tile][1].x, f_res[k_tile][1].y));
+        }
+
+        WARP_REDUCE_MAX_4(m_row_0);
+        WARP_REDUCE_MAX_4(m_row_1);
+
+        float m_new_0 = fmaxf(row_max[0], m_row_0);
+        float m_new_1 = fmaxf(row_max[1], m_row_1);
+        float exp_m_old_minus_m_new_0 = expf(row_max[0] - m_new_0);
+        float exp_m_old_minus_m_new_1 = expf(row_max[1] - m_new_1);
+
+        float l_row_sum_0 = 0.0f;
+        float l_row_sum_1 = 0.0f;
+        #pragma unroll
+        for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+            f_res[k_tile][0].x = expf(f_res[k_tile][0].x - m_new_0);
+            f_res[k_tile][0].y = expf(f_res[k_tile][0].y - m_new_0);
+            f_res[k_tile][1].x = expf(f_res[k_tile][1].x - m_new_1);
+            f_res[k_tile][1].y = expf(f_res[k_tile][1].y - m_new_1);
+
+            l_row_sum_0 += f_res[k_tile][0].x + f_res[k_tile][0].y;
+            l_row_sum_1 += f_res[k_tile][1].x + f_res[k_tile][1].y;
+        }
+
+        WARP_REDUCE_SUM_4(l_row_sum_0);
+        WARP_REDUCE_SUM_4(l_row_sum_1);
+
+        row_l[0] = row_l[0] * exp_m_old_minus_m_new_0 + l_row_sum_0;
+        row_l[1] = row_l[1] * exp_m_old_minus_m_new_1 + l_row_sum_1;
+
+        row_max[0] = m_new_0;
+        row_max[1] = m_new_1;
+
+        // ---- Write P back to s_p[Br][Bc] (same as original) ----
+        int p_row = lane_id / 4 + warp_r * kWarpTileSeqLenQ * kMmaAtomM;
+        int p_col = (lane_id % 4) * 2;
+        #pragma unroll
+        for (int k_tile = 0; k_tile < kWarpTileSeqLenK; k_tile++) {
+            HALF2(R_S[k_tile][0]) = __float22half2_rn(f_res[k_tile][0]);
+            HALF2(R_S[k_tile][1]) = __float22half2_rn(f_res[k_tile][1]);
+
+            LDST32BITS(s_p[p_row * Bc + p_col + k_tile * 8]) = LDST32BITS(R_S[k_tile][0]);
+            LDST32BITS(s_p[(p_row + 8) * Bc + p_col + k_tile * 8]) = LDST32BITS(R_S[k_tile][1]);
+        }
+
+        // ---- g(V) -> s(V) [Bc, kHeadDim] (same as original) ----
+        constexpr int kVecPerRowV = kHeadDim / kHalfPer128Bit;
+        constexpr int kItersV = (Bc * kHeadDim) / kHalfPer128Bit / kNumThreads_fg;
+        #pragma unroll
+        for (int iter = 0; iter < kItersV; ++iter) {
+            int vec_idx = iter * kNumThreads_fg + thread_id;
+            int row = vec_idx / kVecPerRowV;
+            int col = (vec_idx % kVecPerRowV) * kHalfPer128Bit;
+            if (j * Bc + row < QKV_seqlen) {
+                LDST128BITS(s_v[row * kHeadDim + col])
+                    = LDST128BITS(V[V_addr_offset + j * Bc * kHeadDim + row * kHeadDim + col]);
+            } else {
+                float4 zero = {0.0f, 0.0f, 0.0f, 0.0f};
+                LDST128BITS(s_v[row * kHeadDim + col]) = zero;
+            }
+        }
+        __syncthreads();
+
+        // ---- Rescale O (same as original) ----
+        #pragma unroll
+        for (int i = 0; i < kHeadDim / kMmaAtomN; i++) {
+            float2 f_o_0 = __half22float2(HALF2(R_O[i][0]));
+            float2 f_o_1 = __half22float2(HALF2(R_O[i][1]));
+            f_o_0.x *= exp_m_old_minus_m_new_0;
+            f_o_0.y *= exp_m_old_minus_m_new_0;
+            f_o_1.x *= exp_m_old_minus_m_new_1;
+            f_o_1.y *= exp_m_old_minus_m_new_1;
+            HALF2(R_O[i][0]) = __float22half2_rn(f_o_0);
+            HALF2(R_O[i][1]) = __float22half2_rn(f_o_1);
+        }
+
+        // ---- P@V MMA (same as original) ----
+        #pragma unroll
+        for (int i_dim = 0; i_dim < kHeadDim / kMmaAtomN; i_dim++) {
+            #pragma unroll
+            for (int p_step = 0; p_step < kWarpTileSeqLenK / 2; p_step++) {
+                int p_row_mma = lane_id % kMmaAtomM + warp_r * kWarpTileSeqLenQ * kMmaAtomM;
+                int p_col_mma = (lane_id / kMmaAtomM) * 8 + p_step * kMmaAtomK;
+                uint32_t p_addr = __cvta_generic_to_shared(&s_p[p_row_mma * Bc + p_col_mma]);
+                LDMATRIX_X4(R_Q[0], R_Q[1], R_Q[2], R_Q[3], p_addr);
+
+                int v_row = lane_id % kMmaAtomM + p_step * kMmaAtomK;
+                int v_col = ((lane_id / kMmaAtomM) % 2) * 8 + i_dim * kMmaAtomN;
+                uint32_t v_addr = __cvta_generic_to_shared(&s_v[v_row * kHeadDim + v_col]);
+                LDMATRIX_X2_T(R_K[0], R_K[1], v_addr);
+
+                HMMA16816(R_O[i_dim][0], R_O[i_dim][1],
+                          R_Q[0], R_Q[1], R_Q[2], R_Q[3],
+                          R_K[0], R_K[1],
+                          R_O[i_dim][0], R_O[i_dim][1]);
+            }
+        }
+        __syncthreads();
+
+    }  // end loop over K seqlen tiles
+
+    // ---- Final rescale & writeback O (same as original) ----
+    float inv_l_0 = __frcp_rn(row_l[0]);
+    float inv_l_1 = __frcp_rn(row_l[1]);
+
+    #pragma unroll
+    for (int i_dim = 0; i_dim < kHeadDim / kMmaAtomN; i_dim++) {
+        float2 f_o_0 = __half22float2(HALF2(R_O[i_dim][0]));
+        float2 f_o_1 = __half22float2(HALF2(R_O[i_dim][1]));
+        f_o_0.x *= inv_l_0;
+        f_o_0.y *= inv_l_0;
+        f_o_1.x *= inv_l_1;
+        f_o_1.y *= inv_l_1;
+
+        int o_row = lane_id / 4 + warp_r * kWarpTileSeqLenQ * kMmaAtomM;
+        int o_col = (lane_id % 4) * 2 + i_dim * kMmaAtomN;
+
+        int g_row_o_0 = Tr * Br + o_row + 0;
+        int g_row_o_8 = Tr * Br + o_row + 8;
+
+        if (g_row_o_0 < QKV_seqlen) {
+            LDST32BITS(O[O_addr_offset + (o_row + 0) * kHeadDim + o_col]) = __float22half2_rn(f_o_0);
+        }
+        if (g_row_o_8 < QKV_seqlen) {
+            LDST32BITS(O[O_addr_offset + (o_row + 8) * kHeadDim + o_col]) = __float22half2_rn(f_o_1);
+        }
+    }
+}

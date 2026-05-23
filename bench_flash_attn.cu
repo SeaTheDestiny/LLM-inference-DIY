@@ -115,6 +115,38 @@ void bench_all_kernels(int N, FILE* csv_out) {
         measure(fn, "final_optimized", smem);
     }
     
+    // ---- TUNED A: Bigger Tiles (Br=128,Bc=128, 256 threads) ----
+    {
+        constexpr int TBr = 128, TBc = 128;
+        constexpr int TThr = WARP_SIZE * 8 * 1;  // 8 warps
+        constexpr int Q_sz = TBr * (16 + 8);     // 128*24=3072
+        constexpr int K_sz = TBc * (16 + 8);     // 128*24=3072
+        constexpr int smem = (2 * (Q_sz + K_sz)) * sizeof(half);
+        constexpr int kWTHV = d / 8;
+        const int TTr = (N + TBr - 1) / TBr;
+        
+        dim3 grid_tuned(TTr, 1);
+        dim3 block_tuned(TThr);
+        
+        auto fn = flash_attn_tuned_A_kernel<d, 16,8,16, 8,1, 1,16, 1, kWTHV, 8,8,8, 2,1>;
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        
+        cudaMemset(d_O, 0, total_elements * sizeof(half));
+        fn<<<grid_tuned, block_tuned, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaStreamSynchronize(stream);
+        
+        cudaEventRecord(start, stream);
+        fn<<<grid_tuned, block_tuned, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        
+        float ms;
+        cudaEventElapsedTime(&ms, start, stop);
+        double gflops = total_flops / (ms / 1000.0) / 1e9;
+        fprintf(csv_out, "tuned_A,%d,%d,%.4f,%.2f\n", N, d, ms, gflops);
+        fprintf(stderr, "  %-22s %8.3f ms  %8.1f GFLOPS\n", "tuned_A", ms, gflops);
+    }
+
     // ---- Kernel Ref: Reference (mma_tiling_qkv, FA2-style) ----
     {
         constexpr int kMmaTileSeqLenQ = (d < 128) ? 4 : 8;

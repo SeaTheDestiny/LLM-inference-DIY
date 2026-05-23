@@ -5,59 +5,67 @@ Kernels: finegrained_qk, register_p, async_doublebuf, final_optimized
 
 
 --- N=256 d=64 ---
-  finegrained_qk            0.021 ms     782.5 GFLOPS
-  register_p                0.014 ms    1170.3 GFLOPS
-  async_doublebuf           0.015 ms    1117.9 GFLOPS
-  final_optimized           0.011 ms    1584.0 GFLOPS
-  reference_mma             0.011 ms    1481.0 GFLOPS
+  finegrained_qk            0.022 ms     780.2 GFLOPS
+  register_p                0.014 ms    1175.5 GFLOPS
+  async_doublebuf           0.015 ms    1103.8 GFLOPS
+  final_optimized           0.011 ms    1506.6 GFLOPS
+  tuned_A                   0.011 ms    1489.5 GFLOPS
+  reference_mma             0.011 ms    1489.5 GFLOPS
 
 --- N=512 d=64 ---
-  finegrained_qk            0.038 ms    1771.2 GFLOPS
-  register_p                0.024 ms    2849.4 GFLOPS
-  async_doublebuf           0.025 ms    2727.1 GFLOPS
-  final_optimized           0.017 ms    3855.1 GFLOPS
-  reference_mma             0.020 ms    3313.0 GFLOPS
+  finegrained_qk            0.038 ms    1783.3 GFLOPS
+  register_p                0.025 ms    2730.7 GFLOPS
+  async_doublebuf           0.026 ms    2621.4 GFLOPS
+  final_optimized           0.018 ms    3653.6 GFLOPS
+  tuned_A                   0.018 ms    3640.9 GFLOPS
+  reference_mma             0.019 ms    3449.3 GFLOPS
 
 --- N=1024 d=64 ---
-  finegrained_qk            0.071 ms    3763.4 GFLOPS
-  register_p                0.045 ms    5957.8 GFLOPS
-  async_doublebuf           0.048 ms    5577.5 GFLOPS
+  finegrained_qk            0.071 ms    3787.2 GFLOPS
+  register_p                0.046 ms    5866.2 GFLOPS
+  async_doublebuf           0.049 ms    5461.3 GFLOPS
   final_optimized           0.034 ms    7943.8 GFLOPS
-  reference_mma             0.037 ms    7294.4 GFLOPS
+  tuned_A                   0.033 ms    8248.4 GFLOPS
+  reference_mma             0.036 ms    7423.5 GFLOPS
 
 --- N=2048 d=64 ---
   finegrained_qk            0.138 ms    7772.6 GFLOPS
   register_p                0.087 ms   12336.2 GFLOPS
   async_doublebuf           0.093 ms   11522.8 GFLOPS
-  final_optimized           0.067 ms   16124.2 GFLOPS
+  final_optimized           0.066 ms   16163.0 GFLOPS
+  tuned_A                   0.062 ms   17269.4 GFLOPS
   reference_mma             0.074 ms   14563.6 GFLOPS
 
 --- N=256 d=128 ---
-  finegrained_qk            0.036 ms     941.3 GFLOPS
-  register_p                0.022 ms    1560.4 GFLOPS
-  async_doublebuf           0.021 ms    1581.6 GFLOPS
-  final_optimized           0.018 ms    1885.9 GFLOPS
-  reference_mma             0.016 ms    2036.1 GFLOPS
+  finegrained_qk            0.036 ms     937.9 GFLOPS
+  register_p                0.020 ms    1638.4 GFLOPS
+  async_doublebuf           0.021 ms    1608.2 GFLOPS
+  final_optimized           0.017 ms    1927.5 GFLOPS
+  tuned_A                   0.016 ms    2048.0 GFLOPS
+  reference_mma             0.017 ms    2032.1 GFLOPS
 
 --- N=512 d=128 ---
-  finegrained_qk            0.067 ms    2016.5 GFLOPS
+  finegrained_qk            0.066 ms    2022.3 GFLOPS
   register_p                0.038 ms    3542.5 GFLOPS
   async_doublebuf           0.038 ms    3542.5 GFLOPS
-  final_optimized           0.031 ms    4369.1 GFLOPS
-  reference_mma             0.029 ms    4681.1 GFLOPS
+  final_optimized           0.032 ms    4253.9 GFLOPS
+  tuned_A                   0.029 ms    4681.1 GFLOPS
+  reference_mma             0.029 ms    4634.6 GFLOPS
 
 --- N=1024 d=128 ---
-  finegrained_qk            0.130 ms    4138.4 GFLOPS
+  finegrained_qk            0.130 ms    4128.3 GFLOPS
   register_p                0.074 ms    7281.8 GFLOPS
   async_doublebuf           0.072 ms    7489.8 GFLOPS
-  final_optimized           0.059 ms    9054.1 GFLOPS
-  reference_mma             0.052 ms   10242.5 GFLOPS
+  final_optimized           0.060 ms    9005.5 GFLOPS
+  tuned_A                   0.052 ms   10280.2 GFLOPS
+  reference_mma             0.053 ms   10082.5 GFLOPS
 
 --- N=2048 d=128 ---
   finegrained_qk            0.000 ms       inf GFLOPS
   register_p                0.000 ms       inf GFLOPS
   async_doublebuf           0.000 ms       inf GFLOPS
   final_optimized           0.000 ms       inf GFLOPS
+  tuned_A                   0.000 ms  748288838313422260258803801054273133283901440.0 GFLOPS
   reference_mma             0.000 ms  748288838313422260258803801054273133283901440.0 GFLOPS
 
 Done! Run: python plot_results.py results.csv

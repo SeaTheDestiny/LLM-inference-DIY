@@ -19,7 +19,7 @@
 #include <math.h>
 #include <algorithm>
 
-#define WARP_SIZE 32
+// WARP_SIZE is defined in flash_attn.cu (included below)
 
 // ---- Kernel declarations (from flash_attn.cu, compiled together) ----
 // Include the actual kernel source so templates are instantiated
@@ -125,26 +125,11 @@ float check_error(half *a, half *b, int count, float *out_mean_err) {
 }
 
 // ============================================================
-// Benchmark macro
-// ============================================================
-#define BENCH_KERNEL(name, block, grid, smem, stream, ...)          \
-    do {                                                             \
-        cudaEventRecord(start, stream);                              \
-        name<<<grid, block, smem, stream>>>(__VA_ARGS__);            \
-        cudaEventRecord(stop, stream);                               \
-        cudaEventSynchronize(stop);                                  \
-        float ms = 0;                                                \
-        cudaEventElapsedTime(&ms, start, stop);                      \
-        printf("  %-50s  %8.3f ms\n", #name, ms);                   \
-    } while(0)
-
-
-// ============================================================
 // Main test
 // ============================================================
 int main() {
     // Test configuration
-    const int B = 1, H = 1, N = 256, d = 128;
+    constexpr int B = 1, H = 1, N = 256, d = 64;
     const int Br = 64, Bc = 64;  // tile sizes for multi-warp kernels
     const int num_heads = B * H;
     const int total_elements = B * H * N * d;
@@ -203,6 +188,7 @@ int main() {
     half *h_O_kernel = (half*)malloc(total_elements * sizeof(half));
     float max_err, mean_err;
     const float PASS_THRESHOLD = 2.0f;  // Max tolerable error for half precision
+    float ms;
 
     // ========= Kernel 1: Naive single-warp =========
     printf("\n[2] Testing flash_attn_mma_naive_kernel (Br=16,Bc=16)...\n");
@@ -212,8 +198,12 @@ int main() {
         dim3 block_naive(WARP_SIZE);
 
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_mma_naive_kernel<d>, block_naive, grid_naive, 0, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_mma_naive_kernel<d><<<grid_naive, block_naive, 0, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_mma_naive_kernel<d>", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);
@@ -226,13 +216,23 @@ int main() {
     {
         int Tr = (N + Br - 1) / Br;
         dim3 grid_mw(1, Tr * num_heads);
-        constexpr int NumThreads = WARP_SIZE * 4;  // kMmaTileSeqLenQ=4, kMmaTileSeqLenK=1
+        constexpr int NumThreads = WARP_SIZE * 4;
         dim3 block_mw(NumThreads);
 
+        // Increase max dynamic SMEM: Br=64,d=128 -> ~56KB needed
+        cudaFuncSetAttribute(
+            flash_attn_mma_41warp_18mma_kernel<d, 16, 8, 16, 4, 1, 1, 8>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            65536);
+
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_mma_41warp_18mma_kernel<d, 16, 8, 16, 4, 1, 1, 8>,
-                     block_mw, grid_mw, 0, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_mma_41warp_18mma_kernel<d, 16, 8, 16, 4, 1, 1, 8>
+            <<<grid_mw, block_mw, 0, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_mma_41warp_18mma_kernel", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);
@@ -248,10 +248,10 @@ int main() {
         constexpr int NumThreads = WARP_SIZE * 4;
         dim3 block_fg(NumThreads);
 
-        constexpr int Q_sz = Br * (16 + 8);   // 64*24
-        constexpr int K_sz = Bc * (16 + 8);   // 64*24
-        constexpr int P_sz = Br * Bc;         // 4096
-        constexpr int V_sz = Bc * d;          // 8192
+        constexpr int Q_sz = Br * (16 + 8);
+        constexpr int K_sz = Bc * (16 + 8);
+        constexpr int P_sz = Br * Bc;
+        constexpr int V_sz = Bc * d;
         int smem = (Q_sz + K_sz + P_sz + V_sz) * sizeof(half);
 
         cudaFuncSetAttribute(
@@ -259,9 +259,13 @@ int main() {
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_finegrained_qk_tiling_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8>,
-                     block_fg, grid_fg, smem, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_finegrained_qk_tiling_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8>
+            <<<grid_fg, block_fg, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_finegrained_qk_tiling", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);
@@ -280,16 +284,20 @@ int main() {
         constexpr int Q_sz = Br * (16 + 8);
         constexpr int K_sz = Bc * (16 + 8);
         constexpr int V_sz = Bc * d;
-        int smem = (Q_sz + K_sz + V_sz) * sizeof(half);  // no s_p!
+        int smem = (Q_sz + K_sz + V_sz) * sizeof(half);
 
         cudaFuncSetAttribute(
             flash_attn_register_p_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_register_p_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8>,
-                     block_rp, grid_rp, smem, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_register_p_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8>
+            <<<grid_rp, block_rp, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_register_p_kernel", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);
@@ -315,9 +323,13 @@ int main() {
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_async_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8, 2>,
-                     block_async, grid_async, smem, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_async_kernel<d, 16, 8, 16, 4, 1, 1, 8, 8, 8, 2>
+            <<<grid_async, block_async, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_async_kernel", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);
@@ -335,20 +347,22 @@ int main() {
 
         constexpr int Q_sz = Br * (16 + 8);
         constexpr int K_sz = Bc * (16 + 8);
-        constexpr int V_sz = Bc * (16 + 8);  // fine-grained V!
-        // V reuses Q space: max(2*(Q+K), 2*V) = 2*(Q+K) = 12288 halfs
         int smem = (2 * (Q_sz + K_sz)) * sizeof(half);
 
-        constexpr int kWTHV = d / 8;  // kWarpTileHeadDimV
+        constexpr int kWTHV = d / 8;
 
         cudaFuncSetAttribute(
             flash_attn_final_kernel<d, 16, 8, 16, 4, 1, 1, 8, 1, kWTHV, 8, 8, 8, 2, 1>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
 
         cudaMemset(d_O, 0, total_elements * sizeof(half));
-        BENCH_KERNEL(flash_attn_final_kernel<d, 16, 8, 16, 4, 1, 1, 8, 1, kWTHV, 8, 8, 8, 2, 1>,
-                     block_final, grid_final, smem, stream,
-                     d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(start, stream);
+        flash_attn_final_kernel<d, 16, 8, 16, 4, 1, 1, 8, 1, kWTHV, 8, 8, 8, 2, 1>
+            <<<grid_final, block_final, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("  %-50s  %8.3f ms\n", "flash_attn_final_kernel", ms);
         cudaMemcpy(h_O_kernel, d_O, total_elements * sizeof(half), cudaMemcpyDeviceToHost);
 
         max_err = check_error(h_O_kernel, h_O_ref, total_elements, &mean_err);

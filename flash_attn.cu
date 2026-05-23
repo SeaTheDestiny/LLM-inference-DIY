@@ -136,9 +136,9 @@ int div_ceil(int a, int b) { return (a % b != 0) ? (a / b + 1) : (a / b); }
 
 template <
     const int kHeadDim,          // Headdim, 32,64,128
-    const int kMmaAtomM,         // MMA Atom M, 16
-    const int kMmaAtomN,         // MMA Atom N, 8
-    const int kMmaAtomK,         // MMA Atom K, 16
+    const int kMmaAtomM = 16,         // MMA Atom M, 16
+    const int kMmaAtomN = 8,         // MMA Atom N, 8
+    const int kMmaAtomK = 16,         // MMA Atom K, 16
     const int kWarpTileSeqLenQ = 1,  // 1, more values, M, Br=64*1=64, matmul M
     const int kWarpTileSeqLenK = 2 //
     >
@@ -401,11 +401,11 @@ template <
     const int kWarpTileSeqLenQ = 1,  // 1, more values, M, Br=64*1=64, matmul M
     const int kWarpTileSeqLenK = 8 //  8,
     >
-    constexpr int NumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
 __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_mma_41warp_18mma_kernel(half *Q, half *K, half *V,
                                 half *O, int QKV_seqlen,
                                 int QKV_head) {
+    constexpr int NumThreads = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kWarpTileSeqLenQ * kMmaTileSeqLenQ;
     constexpr int Bc = kMmaAtomN * kWarpTileSeqLenK * kMmaTileSeqLenK;
     int Tc = div_ceil(QKV_seqlen, Bc);
@@ -695,11 +695,11 @@ template <
     const int kPadQ = 8,              // padding for Q tile
     const int kPadK = 8               // padding for K tile
     >
-constexpr int kNumThreads_fg = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-__global__ void __launch_bounds__(kNumThreads_fg)
+__global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_finegrained_qk_tiling_kernel(half *Q, half *K, half *V,
                                             half *O, int QKV_seqlen,
                                             int QKV_head) {
+    constexpr int kNumThreads_fg = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 64
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;  // 64
     const int Tc = div_ceil(QKV_seqlen, Bc);
@@ -984,11 +984,11 @@ template <
     const int kPadQ = 8,
     const int kPadK = 8
     >
-constexpr int kNumThreads_rp = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-__global__ void __launch_bounds__(kNumThreads_rp)
+__global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_register_p_kernel(half *Q, half *K, half *V,
                                  half *O, int QKV_seqlen,
                                  int QKV_head) {
+    constexpr int kNumThreads_rp = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 64
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;  // 64
     const int Tc = div_ceil(QKV_seqlen, Bc);
@@ -1269,11 +1269,11 @@ template <
     const int kPadK = 8,
     const int kStage = 2
     >
-constexpr int kNumThreads_async = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-__global__ void __launch_bounds__(kNumThreads_async)
+__global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_async_kernel(half *Q, half *K, half *V,
                             half *O, int QKV_seqlen,
                             int QKV_head) {
+    constexpr int kNumThreads_async = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;
     const int Tc = div_ceil(QKV_seqlen, Bc);
@@ -1524,11 +1524,11 @@ template <
     const int kStage = 2,
     const int kOStorageAccF32 = 1      // 1 = O accumulate in float32
     >
-constexpr int kNumThreads_final = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
-__global__ void __launch_bounds__(kNumThreads_final)
+__global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_final_kernel(half *Q, half *K, half *V,
                             half *O, int QKV_seqlen,
                             int QKV_head) {
+    constexpr int kNumThreads_final = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;   // 64
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;   // 64
     constexpr int WarpHeadDimV = (kWarpTileHeadDimV == 0) ? (kHeadDim / kMmaAtomN) : kWarpTileHeadDimV;

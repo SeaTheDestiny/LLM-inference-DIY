@@ -18,6 +18,8 @@
 #include <vector>
 
 #include "flash_attn.cu"
+#include "utils.h"
+#include "ref_kernel.cuh"
 
 // ============================================================
 // FLOPs: FlashAttention ≈ 4 * N^2 * d
@@ -111,6 +113,51 @@ void bench_all_kernels(int N, FILE* csv_out) {
         auto fn = flash_attn_final_kernel<d, 16,8,16, 4,1, 1,8, 1, kWTHV, 8,8,8, 2,1>;
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         measure(fn, "final_optimized", smem);
+    }
+    
+    // ---- Kernel Ref: Reference (mma_tiling_qkv, FA2-style) ----
+    {
+        constexpr int kMmaTileSeqLenQ = (d < 128) ? 4 : 8;
+        constexpr int kWarpTileSeqLenK = (d < 128) ? 8 : 16;
+        constexpr int kMmaTileSeqLenP = (d < 128) ? 4 : 8;
+        constexpr int kWarpTileHeadDimV = d / 8;
+        constexpr int kOStorageAccF32 = (d < 256) ? 1 : 0;
+        constexpr int kStage = 2;
+        constexpr int kPad = 8;
+        constexpr int RefThreads = WARP_SIZE * kMmaTileSeqLenQ * 1;
+        constexpr int RefBr = 16 * kMmaTileSeqLenQ * 1;   // kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ
+        constexpr int RefBc = 8 * 1 * kWarpTileSeqLenK;   // kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK
+        const int RefTr = (N + RefBr - 1) / RefBr;
+        
+        constexpr int QK_smem = kStage * (RefBr*(16+kPad) + RefBc*(16+kPad));
+        constexpr int Vr_smem = kStage * (RefBc*(16+kPad));
+        constexpr int smem = (QK_smem > Vr_smem ? QK_smem : Vr_smem) * sizeof(half);
+        
+        dim3 grid_ref(RefTr, 1);  // reference uses blockIdx.x for Q tile
+        dim3 block_ref(RefThreads);
+        
+        auto fn = flash_attn_mma_stages_split_q_tiling_qkv_kernel<
+            d, 16,8,16, kMmaTileSeqLenQ,1, kMmaTileSeqLenP,1, 1,kWarpTileSeqLenK, 1,kWarpTileHeadDimV, kOStorageAccF32, kStage, kPad,kPad,kPad>;
+        
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        
+        cudaMemset(d_O, 0, total_elements * sizeof(half));
+        
+        // Warmup
+        fn<<<grid_ref, block_ref, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaStreamSynchronize(stream);
+        
+        // Measure
+        cudaEventRecord(start, stream);
+        fn<<<grid_ref, block_ref, smem, stream>>>(d_Q, d_K, d_V, d_O, N, H);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        
+        float ms;
+        cudaEventElapsedTime(&ms, start, stop);
+        double gflops = total_flops / (ms / 1000.0) / 1e9;
+        fprintf(csv_out, "reference_mma,%d,%d,%.4f,%.2f\n", N, d, ms, gflops);
+        fprintf(stderr, "  %-22s %8.3f ms  %8.1f GFLOPS\n", "reference_mma", ms, gflops);
     }
     
     cudaEventDestroy(start);

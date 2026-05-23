@@ -1,0 +1,55 @@
+=== Flash Attention Multi-Scenario Benchmark ===
+GPU: RTX 4060 Ti (sm_89)
+Configs: N in {256,512,1024,2048} x d in {64,128}
+Kernels: finegrained_qk, register_p, async_doublebuf, final_optimized
+
+
+--- N=256 d=64 ---
+  finegrained_qk            0.021 ms     781.4 GFLOPS
+  register_p                0.014 ms    1170.3 GFLOPS
+  async_doublebuf           0.015 ms    1106.1 GFLOPS
+  final_optimized           0.011 ms    1515.3 GFLOPS
+
+--- N=512 d=64 ---
+  finegrained_qk            0.038 ms    1772.7 GFLOPS
+  register_p                0.025 ms    2730.7 GFLOPS
+  async_doublebuf           0.026 ms    2621.4 GFLOPS
+  final_optimized           0.018 ms    3705.2 GFLOPS
+
+--- N=1024 d=64 ---
+  finegrained_qk            0.071 ms    3783.8 GFLOPS
+  register_p                0.045 ms    5911.6 GFLOPS
+  async_doublebuf           0.048 ms    5577.5 GFLOPS
+  final_optimized           0.034 ms    7943.8 GFLOPS
+
+--- N=2048 d=64 ---
+  finegrained_qk            0.138 ms    7781.6 GFLOPS
+  register_p                0.087 ms   12336.2 GFLOPS
+  async_doublebuf           0.093 ms   11522.8 GFLOPS
+  final_optimized           0.066 ms   16147.5 GFLOPS
+
+--- N=256 d=128 ---
+  finegrained_qk            0.037 ms     916.6 GFLOPS
+  register_p                0.022 ms    1560.4 GFLOPS
+  async_doublebuf           0.022 ms    1560.4 GFLOPS
+  final_optimized           0.018 ms    1913.5 GFLOPS
+
+--- N=512 d=128 ---
+  finegrained_qk            0.067 ms    1991.6 GFLOPS
+  register_p                0.039 ms    3466.4 GFLOPS
+  async_doublebuf           0.038 ms    3542.5 GFLOPS
+  final_optimized           0.032 ms    4258.2 GFLOPS
+
+--- N=1024 d=128 ---
+  finegrained_qk            0.129 ms    4161.0 GFLOPS
+  register_p                0.074 ms    7281.8 GFLOPS
+  async_doublebuf           0.072 ms    7489.8 GFLOPS
+  final_optimized           0.059 ms    9039.4 GFLOPS
+
+--- N=2048 d=128 ---
+  finegrained_qk            0.000 ms       inf GFLOPS
+  register_p                0.000 ms       inf GFLOPS
+  async_doublebuf           0.000 ms       inf GFLOPS
+  final_optimized           0.000 ms       inf GFLOPS
+
+Done! Run: python plot_results.py results.csv

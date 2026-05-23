@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Flash Attention Benchmark - RTX 4060 Ti</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', sans-serif; max-width:1200px; margin:20px auto; background:#1a1a2e; color:#eee; }
+  h1 { color:#e94560; text-align:center; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:30px; }
+  .card { background:#16213e; border-radius:12px; padding:20px; }
+  .card h2 { color:#0f3460; background:#e94560; padding:8px 16px; border-radius:6px; margin-top:0; }
+  canvas { background:#0f3460; border-radius:8px; }
+  .summary { background:#16213e; border-radius:12px; padding:20px; margin-top:30px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:8px 12px; text-align:right; border-bottom:1px solid #333; }
+  th { background:#0f3460; color:#e94560; }
+  td:first-child, th:first-child { text-align:left; }
+  .best { color:#2ecc71; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<h1>⚡ Flash Attention Benchmark — RTX 4060 Ti (sm_89)</h1>
+<h3 style="text-align:center;color:#aaa;">4 Optimized Kernels × 8 Configurations  |  N ∈ {256, 512, 1024, 2048}  |  d ∈ {64, 128}</h3>
+
+<div class="grid" id="charts"></div>
+
+<div class="summary">
+<h2>📊 Performance Summary</h2>
+<div id="table"></div>
+</div>
+
+<script>
+const raw = `kernel,N,d,time_ms,gflops
+finegrained_qk,256,64,0.0215,781.35
+register_p,256,64,0.0143,1170.29
+async_doublebuf,256,64,0.0152,1106.09
+final_optimized,256,64,0.0111,1515.28
+finegrained_qk,512,64,0.0379,1772.74
+register_p,512,64,0.0246,2730.67
+async_doublebuf,512,64,0.0256,2621.44
+final_optimized,512,64,0.0181,3705.22
+finegrained_qk,1024,64,0.0709,3783.77
+register_p,1024,64,0.0454,5911.63
+async_doublebuf,1024,64,0.0481,5577.53
+final_optimized,1024,64,0.0338,7943.76
+finegrained_qk,2048,64,0.1380,7781.64
+register_p,2048,64,0.0870,12336.19
+async_doublebuf,2048,64,0.0932,11522.81
+final_optimized,2048,64,0.0665,16147.46
+finegrained_qk,256,128,0.0366,916.59
+register_p,256,128,0.0215,1560.38
+async_doublebuf,256,128,0.0215,1560.38
+final_optimized,256,128,0.0175,1913.46
+finegrained_qk,512,128,0.0674,1991.60
+register_p,512,128,0.0387,3466.37
+async_doublebuf,512,128,0.0379,3542.49
+final_optimized,512,128,0.0315,4258.18
+finegrained_qk,1024,128,0.1290,4161.02
+register_p,1024,128,0.0737,7281.78
+async_doublebuf,1024,128,0.0717,7489.83
+final_optimized,1024,128,0.0594,9039.45`;
+
+const data = raw.split('\n').slice(1).map(l => {
+  const [k,N,d,t,g] = l.split(',');
+  return {kernel:k, N:+N, d:+d, time_ms:+t, gflops:+g};
+});
+
+const kernels = [...new Set(data.map(r=>r.kernel))];
+const dVals = [...new Set(data.map(r=>r.d))];
+const nVals = [...new Set(data.map(r=>r.N))].sort((a,b)=>a-b);
+
+const colors = ['#e94560','#0f3460','#3498db','#2ecc71'];
+const labels = {
+  finegrained_qk: 'Step1: FineGrained Q/K',
+  register_p: 'Step2: Register P',
+  async_doublebuf: 'Step3: Async+DoubleBuf',
+  final_optimized: 'Step4+5: Final',
+};
+
+// Create charts
+const grid = document.getElementById('charts');
+dVals.forEach(d => {
+  // TFLOPS chart
+  const card1 = document.createElement('div');
+  card1.className = 'card';
+  card1.innerHTML = `<h2>d = ${d} — TFLOPS</h2><canvas id="tflops_d${d}"></canvas>`;
+  grid.appendChild(card1);
+  
+  const ctx1 = document.getElementById(`tflops_d${d}`).getContext('2d');
+  const dData = data.filter(r => r.d === d);
+  
+  new Chart(ctx1, {
+    type: 'bar',
+    data: {
+      labels: nVals.map(n => `N=${n}`),
+      datasets: kernels.map((k, i) => ({
+        label: labels[k],
+        data: nVals.map(n => {
+          const r = dData.find(x => x.N===n && x.kernel===k);
+          return r ? r.gflops/1000 : 0;
+        }),
+        backgroundColor: colors[i],
+        borderColor: colors[i],
+        borderWidth: 1,
+      }))
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: '#ccc' } },
+        tooltip: { callbacks: { label: ctx => ctx.raw.toFixed(3) + ' TFLOPS' } }
+      },
+      scales: {
+        x: { ticks: { color: '#aaa' }, grid: { color: '#333' } },
+        y: { title: { display: true, text: 'TFLOPS', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' } }
+      }
+    }
+  });
+  
+  // Speedup chart
+  const card2 = document.createElement('div');
+  card2.className = 'card';
+  card2.innerHTML = `<h2>d = ${d} — Speedup (vs Step1 N=256)</h2><canvas id="speedup_d${d}"></canvas>`;
+  grid.appendChild(card2);
+  
+  const baseline = dData.find(r => r.N===256 && r.kernel==='finegrained_qk');
+  const ctx2 = document.getElementById(`speedup_d${d}`).getContext('2d');
+  new Chart(ctx2, {
+    type: 'line',
+    data: {
+      labels: nVals.map(n => `N=${n}`),
+      datasets: kernels.map((k, i) => ({
+        label: labels[k],
+        data: nVals.map(n => {
+          const r = dData.find(x => x.N===n && x.kernel===k);
+          return r && baseline ? (baseline.time_ms / r.time_ms).toFixed(1) : null;
+        }),
+        borderColor: colors[i],
+        backgroundColor: colors[i],
+        tension: 0.3,
+        pointRadius: 6,
+        pointHoverRadius: 10,
+      }))
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { labels: { color: '#ccc' } },
+        tooltip: { callbacks: { label: ctx => ctx.raw + '× speedup' } }
+      },
+      scales: {
+        x: { type:'logarithmic', ticks: { color: '#aaa' }, grid: { color: '#333' } },
+        y: { title: { display: true, text: 'Speedup (×)', color: '#aaa' }, ticks: { color: '#aaa' }, grid: { color: '#333' }, min: 0 }
+      }
+    }
+  });
+});
+
+// Summary table
+let html = '<table><thead><tr><th>Kernel</th>';
+nVals.forEach(n => { html += `<th colspan="3">N=${n}</th>`; });
+html += '</tr><tr><th></th>';
+nVals.forEach(() => { html += '<th>d=64 ms</th><th>GFLOPS</th><th>d=128 ms</th><th>GFLOPS</th>'; });
+html += '</tr></thead><tbody>';
+
+kernels.forEach(k => {
+  html += `<tr><td><b>${labels[k]}</b></td>`;
+  nVals.forEach(n => {
+    [64,128].forEach(d => {
+      const r = data.find(x => x.N===n && x.d===d && x.kernel===k);
+      if (r) html += `<td>${r.time_ms.toFixed(3)}</td><td>${r.gflops.toFixed(0)}</td>`;
+      else html += '<td>—</td><td>—</td>';
+    });
+  });
+  html += '</tr>';
+});
+
+// Best-in-class row
+html += '<tr style="font-weight:bold;background:#0f3460;"><td>🏆 Best Speedup</td>';
+nVals.forEach(n => {
+  const best64 = data.filter(r=>r.N===n&&r.d===64).sort((a,b)=>b.gflops-a.gflops)[0];
+  const best128 = data.filter(r=>r.N===n&&r.d===128).sort((a,b)=>b.gflops-a.gflops)[0];
+  html += `<td class="best">${best64?labels[best64.kernel]:'—'}</td><td class="best">${best64?best64.gflops.toFixed(0):'—'}</td>`;
+  html += `<td class="best">${best128?labels[best128.kernel]:'—'}</td><td class="best">${best128?best128.gflops.toFixed(0):'—'}</td>`;
+});
+html += '</tr>';
+
+html += '</tbody></table>';
+document.getElementById('table').innerHTML = html;
+</script>
+</body>
+</html>

@@ -16,6 +16,8 @@
 #include <math.h>
 #define WARP_SIZE 32
 #include "flash_decode_q1.cuh"
+#include "flash_attn.cu"
+#include "utils.h"
 
 // ============================================================
 // Baseline: Single-warp non-split attention for Q=1
@@ -158,6 +160,28 @@ int main() {
             printf("decode_s1,%d,%d,%.4f,%.2f\n", KVN, d, ms_s1, bw);
             printf("decode_total,%d,%d,%.4f,%.2f\n", KVN, d, ms_total, bw);
             fprintf(stderr, "  decode: s1=%.3f + s2=%.3f = %.3f ms  %6.1f GB/s\n", ms_s1, ms_s2, ms_total, bw);
+        }
+
+        // === FA final_optimized (MMA Br=64, 128 threads) — best single-stage FA for Q=1 ===
+        // With Q=1, it processes 1 valid + 63 padded rows. Measures overhead vs decode.
+        {
+            constexpr int Br = 64, Thr = WARP_SIZE * 4;
+            constexpr int Q_sz = Br * (16 + 8), K_sz = 64 * (16 + 8);
+            int smem = (2*(Q_sz+K_sz))*sizeof(half);
+            auto fn = flash_attn_final_kernel<d, 16,8,16, 4,1, 1,8, 1, (d/8), 8,8,8, 2,1>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            cudaMemset(d_O, 0, total_Q*sizeof(half));
+            fn<<<dim3(1,1), dim3(Thr), smem, stream>>>(d_Q, d_K, d_V, d_O, 1, 1);
+            cudaStreamSynchronize(stream);
+            cudaEventRecord(start, stream);
+            fn<<<dim3(1,1), dim3(Thr), smem, stream>>>(d_Q, d_K, d_V, d_O, 1, 1);
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            float ms_fa;
+            cudaEventElapsedTime(&ms_fa, start, stop);
+            double bw_fa = total_bytes / (ms_fa / 1000.0) / 1e9;
+            printf("fa_final,%d,%d,%.4f,%.2f\n", KVN, d, ms_fa, bw_fa);
+            fprintf(stderr, "  FA(final,Br=64):    %8.3f ms  %6.1f GB/s\n", ms_fa, bw_fa);
         }
 
         // Correctness check (baseline = reference)

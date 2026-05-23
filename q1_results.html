@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Q=1 Flash Decoding vs Baseline — RTX 4060 Ti</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box} body{font-family:'Segoe UI',sans-serif;max-width:1100px;margin:20px auto;background:#1a1a2e;color:#eee;padding:20px}
+  h1{color:#e94560;text-align:center} h3{text-align:center;color:#aaa}
+  .row{display:flex;gap:24px;margin-bottom:24px;flex-wrap:wrap}
+  .card{flex:1;min-width:480px;background:#16213e;border-radius:12px;padding:20px}
+  .card h2{color:#fff;background:linear-gradient(135deg,#e94560,#0f3460);padding:10px 18px;border-radius:8px;margin:0 0 16px 0;font-size:16px}
+  .card canvas{width:100%!important;max-height:380px}
+  .summary{background:#16213e;border-radius:12px;padding:24px;margin-top:20px}
+  .summary h2{color:#e94560} table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 14px;text-align:right;border-bottom:1px solid #333} th{background:#0f3460;color:#e94560}
+  td:first-child,th:first-child{text-align:left} .green{color:#2ecc71;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>⚡ Q=1 Flash Decoding (True Inference) — RTX 4060 Ti</h1>
+<h3>batch=1, Q_seqlen=1, d=128, KV∈{256..8192}  |  Baseline: 1-warp serial  |  Decode: split+reduce</h3>
+
+<div class="row" id="charts"></div>
+
+<div class="summary"><h2>📊 数据总表 (全部 Max Error = 0.000000 ✅)</h2><table id="tbl"></table></div>
+
+<script>
+const data=[
+  {kv:256,base:0.096,ds1:0.010,ds2:0.012,dtot:0.021,bwB:1.4,bwD:6.3},
+  {kv:512,base:0.187,ds1:0.009,ds2:0.009,dtot:0.019,bwB:1.4,bwD:14.6},
+  {kv:1024,base:0.370,ds1:0.009,ds2:0.015,dtot:0.024,bwB:1.5,bwD:22.6},
+  {kv:2048,base:1.101,ds1:0.010,ds2:0.028,dtot:0.038,bwB:1.0,bwD:28.6},
+  {kv:4096,base:1.467,ds1:0.010,ds2:0.051,dtot:0.061,bwB:1.5,bwD:35.2},
+  {kv:8192,base:4.584,ds1:0.012,ds2:0.100,dtot:0.113,bwB:0.9,bwD:38.4},
+];
+const kvVals=data.map(d=>d.kv);
+
+const charts=document.getElementById('charts');
+
+// Latency chart
+const c1=document.createElement('div');c1.className='card';
+c1.innerHTML='<h2>⏱️ Latency (越低越好, KV=8192 场景 Flash Decode 快 40×)</h2><canvas id="lat"></canvas>';
+charts.appendChild(c1);
+new Chart(document.getElementById('lat'),{type:'bar',
+  data:{labels:kvVals.map(k=>'KV='+k),
+    datasets:[
+      {label:'Baseline (1 warp serial)',data:data.map(d=>d.base),backgroundColor:'rgba(233,69,96,0.8)',borderColor:'#e94560',borderWidth:1},
+      {label:'Flash Decode Stage1',data:data.map(d=>d.ds1),backgroundColor:'rgba(52,152,219,0.8)',borderColor:'#3498db',borderWidth:1},
+      {label:'Flash Decode Stage2',data:data.map(d=>d.ds2),backgroundColor:'rgba(46,204,113,0.8)',borderColor:'#2ecc71',borderWidth:1},
+    ]},
+  options:{responsive:true,
+    plugins:{legend:{position:'top',labels:{padding:15,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.raw.toFixed(3)+' ms'}}},
+    scales:{x:{stacked:true},y:{stacked:true,title:{display:true,text:'ms'},beginAtZero:true}}}
+});
+
+// Bandwidth chart
+const c2=document.createElement('div');c2.className='card';
+c2.innerHTML='<h2>📊 Memory Bandwidth (越高越好)</h2><canvas id="bw"></canvas>';
+charts.appendChild(c2);
+new Chart(document.getElementById('bw'),{type:'line',
+  data:{labels:kvVals.map(k=>'KV='+k),
+    datasets:[
+      {label:'Baseline',data:data.map(d=>d.bwB),borderColor:'#e94560',backgroundColor:'rgba(233,69,96,0.3)',tension:0.3,pointRadius:8,borderWidth:3},
+      {label:'Flash Decode (s1+s2)',data:data.map(d=>d.bwD),borderColor:'#2ecc71',backgroundColor:'rgba(46,204,113,0.3)',tension:0.3,pointRadius:8,borderWidth:3},
+    ]},
+  options:{responsive:true,
+    plugins:{legend:{position:'top',labels:{padding:15,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.raw.toFixed(1)+' GB/s'}}},
+    scales:{y:{title:{display:true,text:'GB/s'},beginAtZero:true,grid:{color:'rgba(255,255,255,0.05)'}}}}
+});
+
+// Table
+let h='<thead><tr><th>KV</th><th>Splits</th><th>Baseline ms</th><th>Decode ms</th><th>加速比</th><th>Baseline BW</th><th>Decode BW</th></tr></thead><tbody>';
+data.forEach(d=>{
+  h+=`<tr><td>${d.kv}</td><td>${d.kv/16}</td><td>${d.base.toFixed(3)}</td><td class="green">${d.dtot.toFixed(3)}</td><td class="green">${(d.base/d.dtot).toFixed(1)}×</td><td>${d.bwB.toFixed(1)} GB/s</td><td class="green">${d.bwD.toFixed(1)} GB/s</td></tr>`;
+});
+h+='</tbody>';
+document.getElementById('tbl').innerHTML=h;
+</script>
+</body>
+</html>

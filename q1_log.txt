@@ -1,0 +1,28 @@
+=== Q=1 Flash Decoding vs Baseline (d=128) ===
+
+--- KV=256 chunks=16 ---
+  baseline:              0.096 ms     1.4 GB/s
+  decode: s1=0.010 + s2=0.012 = 0.021 ms     6.3 GB/s
+  Max error: 0.000000  PASS
+--- KV=512 chunks=32 ---
+  baseline:              0.187 ms     1.4 GB/s
+  decode: s1=0.009 + s2=0.009 = 0.019 ms    14.6 GB/s
+  Max error: 0.000000  PASS
+--- KV=1024 chunks=64 ---
+  baseline:              0.370 ms     1.5 GB/s
+  decode: s1=0.009 + s2=0.015 = 0.024 ms    22.6 GB/s
+  Max error: 0.000000  PASS
+--- KV=2048 chunks=128 ---
+  baseline:              1.101 ms     1.0 GB/s
+  decode: s1=0.010 + s2=0.028 = 0.038 ms    28.6 GB/s
+  Max error: 0.000000  PASS
+--- KV=4096 chunks=256 ---
+  baseline:              1.467 ms     1.5 GB/s
+  decode: s1=0.010 + s2=0.051 = 0.061 ms    35.2 GB/s
+  Max error: 0.000000  PASS
+--- KV=8192 chunks=512 ---
+  baseline:              4.584 ms     0.9 GB/s
+  decode: s1=0.012 + s2=0.100 = 0.113 ms    38.4 GB/s
+  Max error: 0.000000  PASS
+
+Done!

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Flash Decoding Benchmark - RTX 4060 Ti</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box} body{font-family:'Segoe UI',sans-serif;max-width:1100px;margin:20px auto;background:#1a1a2e;color:#eee;padding:0 20px}
+  h1{color:#e94560;text-align:center} h3{text-align:center;color:#aaa;font-weight:normal}
+  .row{display:flex;gap:24px;margin-bottom:24px;flex-wrap:wrap}
+  .card{flex:1;min-width:450px;background:#16213e;border-radius:12px;padding:20px}
+  .card h2{color:#fff;background:linear-gradient(135deg,#e94560,#0f3460);padding:10px 18px;border-radius:8px;margin:0 0 16px 0;font-size:16px}
+  .card canvas{width:100%!important;max-height:350px}
+  .summary{background:#16213e;border-radius:12px;padding:24px;margin-top:30px;overflow-x:auto}
+  .summary h2{color:#e94560;margin-top:0} table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 14px;text-align:right;border-bottom:1px solid #333} th{background:#0f3460;color:#e94560}
+  td:first-child,th:first-child{text-align:left}
+  .pass{color:#2ecc71;font-weight:bold} .note{color:#888;font-size:13px;margin-top:16px;line-height:1.8}
+</style>
+</head>
+<body>
+<h1>⚡ Flash Decoding — RTX 4060 Ti (sm_89)</h1>
+<h3>Q_seqlen=32, KV_seqlen∈{256,512,1024,2048}, d∈{64,128}, Br=Bc=16</h3>
+
+<div class="row" id="charts"></div>
+
+<div class="summary">
+<h2>📊 正确性 & 性能总表</h2>
+<table id="tbl"></table>
+<p class="note">
+  ✅ 所有配置通过正确性验证（vs CPU FP32 reference）<br>
+  💡 典型LLM解码场景：Q_seqlen=1~32, KV_seqlen很大。Stage1 每个block独立处理1个KV chunk。<br>
+  ⚡ Stage1 极快 (μs级)，Stage2 reduction 随 split 数线性增长，是主要开销
+</p>
+</div>
+
+<script>
+const raw = `kernel,N_kv,N_q,d,time_ms,gflops
+stage1,256,32,64,0.0059,354.25
+stage2,256,32,64,0.0123,354.25
+stage1,512,32,64,0.0043,970.90
+stage2,512,32,64,0.0162,970.90
+stage1,1024,32,64,0.0051,1638.40
+stage2,1024,32,64,0.0184,1638.40
+stage1,2048,32,64,0.0072,2340.57
+stage2,2048,32,64,0.0573,2340.57
+stage1,256,32,128,0.0060,704.69
+stage2,256,32,128,0.0078,704.69
+stage1,512,32,128,0.0061,1365.33
+stage2,512,32,128,0.0115,1365.33
+stage1,1024,32,128,0.0072,2340.57
+stage2,1024,32,128,0.0215,2340.57
+stage1,2048,32,128,0.0107,3148.88
+stage2,2048,32,128,0.0430,3148.88`;
+
+const data = raw.split('\n').slice(1).map(l=>{const[p,kv,q,d,t,g]=l.split(',');return{kernel:p,N_kv:+kv,N_q:+q,d:+d,time_ms:+t,gflops:+g};});
+const dVals=[64,128], kvVals=[256,512,1024,2048];
+
+const charts=document.getElementById('charts');
+dVals.forEach(d=>{
+  const card=document.createElement('div');card.className='card';
+  card.innerHTML=`<h2>d=${d} — Stage1+Stage2 耗时</h2><canvas id="c_d${d}"></canvas>`;
+  charts.appendChild(card);
+  const dd=data.filter(r=>r.d===d);
+  new Chart(document.getElementById(`c_d${d}`),{type:'bar',
+    data:{labels:kvVals.map(k=>`KV=${k}`),
+      datasets:[
+        {label:'Stage1 (per-chunk attn)',data:kvVals.map(k=>{const r=dd.find(x=>x.N_kv===k&&x.kernel==='stage1');return r?r.time_ms:null}),backgroundColor:'rgba(52,152,219,0.8)',borderColor:'#3498db',borderWidth:1},
+        {label:'Stage2 (LSE reduce)',data:kvVals.map(k=>{const r=dd.find(x=>x.N_kv===k&&x.kernel==='stage2');return r?r.time_ms:null}),backgroundColor:'rgba(233,69,96,0.8)',borderColor:'#e94560',borderWidth:1},
+      ]},
+    options:{responsive:true,maintainAspectRatio:true,
+      plugins:{legend:{position:'top',labels:{padding:15,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.raw.toFixed(3)+' ms'}}},
+      scales:{x:{stacked:true},y:{stacked:true,title:{display:true,text:'Time (ms)'},beginAtZero:true,grid:{color:'rgba(255,255,255,0.05)'}}}}
+  });
+});
+
+// Table
+let errors=[{kv:256,d:64,e:'0.0063/0.017'},{kv:512,d:64,e:'0.0052/0.012'},{kv:1024,d:64,e:'0.0033/0.009'},{kv:2048,d:64,e:'0.0025/0.007'},{kv:256,d:128,e:'0.0065/0.016'},{kv:512,d:128,e:'0.0046/0.013'},{kv:1024,d:128,e:'0.0029/0.009'},{kv:2048,d:128,e:'0.0020/0.006'}];
+let h='<thead><tr><th>KV_seqlen</th><th>d</th><th>splits</th><th>Stage1 ms</th><th>Stage2 ms</th><th>Total ms</th><th>Max Error</th><th></th></tr></thead><tbody>';
+errors.forEach((e,i)=>{
+  const s1=data.find(r=>r.N_kv===e.kv&&r.d===e.d&&r.kernel==='stage1');
+  const s2=data.find(r=>r.N_kv===e.kv&&r.d===e.d&&r.kernel==='stage2');
+  h+=`<tr><td>${e.kv}</td><td>${e.d}</td><td>${e.kv/16}</td><td>${s1?+s1.time_ms.toFixed(3):'—'}</td><td>${s2?+s2.time_ms.toFixed(3):'—'}</td><td>${s1&&s2?(s1.time_ms+s2.time_ms).toFixed(3):'—'}</td><td>${e.e}</td><td class="pass">✅ PASS</td></tr>`;
+});
+h+='</tbody>';
+document.getElementById('tbl').innerHTML=h;
+</script>
+</body>
+</html>

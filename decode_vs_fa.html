@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Flash Decoding vs Flash Attention — RTX 4060 Ti</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box} body{font-family:'Segoe UI',sans-serif;max-width:1200px;margin:20px auto;background:#1a1a2e;color:#eee;padding:0 20px}
+  h1{color:#e94560;text-align:center} h3{text-align:center;color:#aaa}
+  .row{display:flex;gap:24px;margin-bottom:24px;flex-wrap:wrap}
+  .card{flex:1;min-width:500px;background:#16213e;border-radius:12px;padding:20px}
+  .card h2{color:#fff;background:linear-gradient(135deg,#e94560,#0f3460);padding:10px 18px;border-radius:8px;margin:0 0 16px 0;font-size:16px}
+  .card canvas{width:100%!important;max-height:400px}
+  .summary{background:#16213e;border-radius:12px;padding:24px;margin-top:30px}
+  .summary h2{color:#e94560} table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{padding:8px 14px;text-align:right;border-bottom:1px solid #333} th{background:#0f3460;color:#e94560}
+  td:first-child,th:first-child{text-align:left}
+  .fa-win{color:#2ecc71;font-weight:bold} .note{color:#888;font-size:13px;margin-top:16px;line-height:1.8}
+</style>
+</head>
+<body>
+<h1>⚡ Flash Decoding vs Flash Attention — KV=4096, d=128</h1>
+<h3>Q_seqlen ∈ {1,4,16,64,256}  |  RTX 4060 Ti (sm_89)</h3>
+
+<div class="row" id="charts"></div>
+
+<div class="summary">
+<h2>📊 详细数据</h2>
+<table id="tbl"></table>
+<p class="note">
+  🔍 <b>分析</b>：小 Q 场景下 FA 反而更快，因为单 block 计算密度高 (4096 次 K 迭代 vs 1 次)<br>
+  ⚠️ Flash Decoding 的 split 策略分摊了大量 launch overhead（256 个 block，每个只做 1 次迭代）<br>
+  💡 Flash Decoding 的优势在<b>流式推理 pipeline</b>中体现：KV cache 持久化，Stage1 可分批异步执行
+</p>
+</div>
+
+<script>
+const raw=`kernel,Q_seqlen,KV_seqlen,d,time_ms,gflops
+decode_s1,1,4096,128,0.0126,166.72
+decode_s2,1,4096,128,0.0535,39.25
+decode_total,1,4096,128,0.0661,31.76
+flash_attn,1,4096,128,0.0061,341.33
+decode_s1,4,4096,128,0.0125,671.09
+decode_s2,4,4096,128,0.0579,144.81
+decode_total,4,4096,128,0.0704,119.12
+flash_attn,4,4096,128,0.0061,1365.33
+decode_s1,16,4096,128,0.0130,2587.69
+decode_s2,16,4096,128,0.0757,444.23
+decode_total,16,4096,128,0.0887,379.07
+flash_attn,16,4096,128,0.0062,5461.33
+decode_s1,64,4096,128,0.0152,8838.74
+decode_s2,64,4096,128,0.0966,1388.77
+decode_total,64,4096,128,0.1118,1200.63
+flash_attn,64,4096,128,0.0070,19200.91
+decode_s1,256,4096,128,0.0164,32768.00
+decode_s2,256,4096,128,0.0970,5539.79
+decode_total,256,4096,128,0.1134,4738.93
+flash_attn,256,4096,128,0.0173,31072.83`;
+
+const data=raw.split('\n').slice(1).map(l=>{const[k,q,kv,d,t,g]=l.split(',');return{kernel:k,Q:+q,KV:+kv,d:+d,ms:+t,gflops:+g};});
+const qVals=[1,4,16,64,256];
+const total=data.filter(r=>r.kernel==='decode_total');
+const fa=data.filter(r=>r.kernel==='flash_attn');
+
+// Latency chart
+const charts=document.getElementById('charts');
+const c1=document.createElement('div');c1.className='card';
+c1.innerHTML='<h2>⏱️ 耗时对比 (越低越好)</h2><canvas id="latency"></canvas>';
+charts.appendChild(c1);
+new Chart(document.getElementById('latency'),{type:'bar',
+  data:{labels:qVals.map(q=>'Q='+q),
+    datasets:[
+      {label:'Flash Decoding (s1+s2)',data:total.map(r=>r.ms),backgroundColor:'rgba(233,69,96,0.8)',borderColor:'#e94560',borderWidth:1},
+      {label:'Flash Attention (tuned_A)',data:fa.map(r=>r.ms),backgroundColor:'rgba(46,204,113,0.8)',borderColor:'#2ecc71',borderWidth:1},
+    ]},
+  options:{responsive:true,
+    plugins:{legend:{position:'top',labels:{padding:15,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.raw.toFixed(4)+' ms'}}},
+    scales:{y:{title:{display:true,text:'Latency (ms)'},beginAtZero:true,grid:{color:'rgba(255,255,255,0.05)'}}}}
+});
+
+// GFLOPS chart
+const c2=document.createElement('div');c2.className='card';
+c2.innerHTML='<h2>📊 GFLOPS 对比 (越高越好)</h2><canvas id="gflops"></canvas>';
+charts.appendChild(c2);
+new Chart(document.getElementById('gflops'),{type:'bar',
+  data:{labels:qVals.map(q=>'Q='+q),
+    datasets:[
+      {label:'Flash Decoding',data:total.map(r=>r.gflops),backgroundColor:'rgba(233,69,96,0.8)',borderColor:'#e94560',borderWidth:1},
+      {label:'Flash Attention (tuned_A)',data:fa.map(r=>r.gflops),backgroundColor:'rgba(46,204,113,0.8)',borderColor:'#2ecc71',borderWidth:1},
+    ]},
+  options:{responsive:true,
+    plugins:{legend:{position:'top',labels:{padding:15,usePointStyle:true}},tooltip:{callbacks:{label:c=>c.raw.toFixed(1)+' GFLOPS'}}},
+    scales:{y:{title:{display:true,text:'GFLOPS'},beginAtZero:true,grid:{color:'rgba(255,255,255,0.05)'}}}}
+});
+
+// Table
+let h='<thead><tr><th>Q_seqlen</th><th>Decode ms</th><th>Decode GFLOPS</th><th>FA ms</th><th>FA GFLOPS</th><th>FA 快多少</th></tr></thead><tbody>';
+qVals.forEach((q,i)=>{
+  const dt=total[i], ft=fa[i];
+  const ratio=ft.ms>0?(dt.ms/ft.ms).toFixed(1):'—';
+  h+=`<tr><td>${q}</td><td>${dt.ms.toFixed(3)}</td><td>${dt.gflops.toFixed(0)}</td><td class="fa-win">${ft.ms.toFixed(3)}</td><td class="fa-win">${ft.gflops.toFixed(0)}</td><td class="fa-win">${ratio}×</td></tr>`;
+});
+h+='</tbody>';
+document.getElementById('tbl').innerHTML=h;
+</script>
+</body>
+</html>

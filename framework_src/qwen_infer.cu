@@ -310,29 +310,25 @@ public:
         cudaFree(d_fd_lse);
     }
     
-    // High-performance Matrix Multiplication Helper using custom HGEMV for single token, with fallback to cuBLAS
+    // High-performance Matrix Multiplication: HGEMV (m=1) / HGEMM (m>1)
     void gemm(half* out, const half* in, const half* weight, int m, int n, int k) {
         if (m == 1) {
-            // Highly optimized custom matrix-vector HGEMV kernel
             int threads = 256;
             int blocks = (n + threads - 1) / threads;
             hgemv_kernel<<<blocks, threads>>>(in, weight, out, n, k);
         } else {
-            // Fallback to cuBLAS for large batch / matrix-matrix multiplication
-            float alpha = 1.0f;
-            float beta = 0.0f;
-            cublasGemmEx(
-                cublas_handle,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                n, m, k,
-                &alpha,
-                weight, CUDA_R_16F, n,
-                in, CUDA_R_16F, k,
-                &beta,
-                out, CUDA_R_16F, n,
-                CUBLAS_COMPUTE_32F,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP
-            );
+            // Our own HGEMM: A[m,k] row-major, B[k,n] row-major
+            // weight is already [k, n] row-major (we transposed it at load time)
+            constexpr int BM=128, BN=128, WM=2, WN=4, WK=2;
+            constexpr int A_sz = BM * (16 * WK);
+            constexpr int B_sz = (16 * WK) * BN;
+            int smem = 2 * (A_sz + B_sz) * sizeof(half);
+            int MT = (m + BM - 1) / BM;
+            int NT = (n + BN - 1) / BN;
+            dim3 g(NT, MT), b(WARP_SIZE * WM * WN);
+            auto fn = hgemm_opt_kernel<BM, BN, WM, WN, BM/16/WM, BN/8/WN, WK, true, 2, 0>;
+            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            fn<<<g, b, smem>>>((half*)in, (half*)weight, out, m, n, k);
         }
     }
 

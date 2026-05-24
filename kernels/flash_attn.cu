@@ -1998,6 +1998,22 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
         }
 
         // Online Safe Softmax (__hmax, __expf, __fmaf_rn)
+        // Causal mask (if enabled): token i only attends to tokens [0..i]
+#ifdef FLASH_ATTN_CAUSAL
+        #pragma unroll
+        for (int kt = 0; kt < kWarpTileSeqLenK; kt++) {
+            half *hp0 = reinterpret_cast<half *>(&R_S[0][kt][0]);
+            half *hp1 = reinterpret_cast<half *>(&R_S[0][kt][1]);
+            int q0 = wQP * kMmaAtomM + lid / 4;
+            int q1 = q0 + kMmaAtomM / 2;
+            int k0 = j * Bc + kt * kMmaAtomN + (lid % 4) * 2;
+            int k1 = k0 + 1;
+            if (k0 > q0) hp0[0] = __float2half(-INFINITY);
+            if (k1 > q0) hp0[1] = __float2half(-INFINITY);
+            if (k0 > q1) hp1[0] = __float2half(-INFINITY);
+            if (k1 > q1) hp1[1] = __float2half(-INFINITY);
+        }
+#endif
         float rm_new[2] = {-INFINITY, -INFINITY};
         float rl_new[2] = {0.0f, 0.0f};
         #pragma unroll

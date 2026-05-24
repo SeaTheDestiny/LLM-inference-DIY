@@ -1879,14 +1879,18 @@ template <
     const int kOStorageAccF32 = 1
     >
 __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
-    flash_attn_tuned_A_kernel(half *Q, half *K, half *V,
-    // Runtime stride parameters: allow interleaved KV-cache access (like FD v5)
-    //   Default kHeadDim = per-head contiguous (bench mode, backward compat)
-    //   Set stride_KV = hidden_size for interleaved KV-cache [seqlen, numHeads*headDim]
-                              half *O, int QKV_seqlen,
-                              int QKV_head,
-                              int stride_Q  = kHeadDim,
-                              int stride_KV = kHeadDim) {
+    flash_attn_tuned_A_kernel(
+    // NOTE: when using per-head pointers with interleaved KV-cache,
+    //   set stride_KV = hidden_size, K_ofs_override = 0, V_ofs_override = 0.
+    //   QKV_head should be 1 (or 0 for the base offset).
+    half *Q, half *K, half *V,
+    half *O, int QKV_seqlen,
+    int QKV_head,
+    int stride_Q  = kHeadDim,
+    int stride_KV = kHeadDim,
+    int K_ofs_override = -1,   // -1 = auto from QKV_head; 0 = per-head pointer
+    int V_ofs_override = -1
+    ) {
     constexpr int kThrA = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 128
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;  // 128
@@ -1897,8 +1901,8 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     // Per-head pointers: QKV_head=1 means Qh/Kh/Vh/Oh point to single head's data.
     // Offset = QKV_head * QKV_seqlen * kHeadDim works as a "skip past this head" offset.
     int Q_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
-    int K_ofs = QKV_head * QKV_seqlen * stride_KV;
-    int V_ofs = QKV_head * QKV_seqlen * stride_KV;
+    int K_ofs = (K_ofs_override >= 0) ? K_ofs_override : QKV_head * QKV_seqlen * stride_KV;
+    int V_ofs = (V_ofs_override >= 0) ? V_ofs_override : QKV_head * QKV_seqlen * stride_KV;
     int O_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
 
     constexpr int Q_sz = Br * (kMmaAtomK + kPadQ);        // 128*24=3072

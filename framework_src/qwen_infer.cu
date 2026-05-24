@@ -387,12 +387,14 @@ public:
                 int smem = 2*(Q_sz+K_sz)*sizeof(half);
                 auto fa = flash_attn_tuned_A_kernel<kHD,16,8,16,8,1,1,16,1,0,8,8,8,2,1>;
                 cudaFuncSetAttribute(fa, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                half* kvk = d_kv_cache_k + (size_t)l * config.max_seqlen * H;
+                half* kvv = d_kv_cache_v + (size_t)l * config.max_seqlen * H;
                 for (int h = 0; h < NH; h++) {
                     half* Qh = d_prefill_q + h * N * kHD;
-                    half* Kh = d_prefill_k + h * N * kHD;
-                    half* Vh = d_prefill_v + h * N * kHD;
+                    half* Kh = kvk + h * kHD;   // interleaved KV-cache, stride=H
+                    half* Vh = kvv + h * kHD;
                     half* Oh = d_prefill_o + h * N * kHD;
-                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, 1, kHD, kHD);  // stride_Q=stride_KV=kHD (per-head gathered)
+                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, 1, kHD, (int)H, 0, 0);
                 }
                 cudaDeviceSynchronize();
             }

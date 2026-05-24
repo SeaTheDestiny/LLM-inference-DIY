@@ -10,9 +10,10 @@ from transformers import AutoTokenizer
 app = Flask(__name__, static_folder=".", template_folder=".")
 
 # 1. Path Configurations
-MODEL_DIR = "../model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"
-ENGINE_EXE = "../framework_src/qwen_infer.exe"
-MODEL_BIN = "../model_weights/qwen_1.8b.bin"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"))
+ENGINE_EXE = os.path.abspath(os.path.join(BASE_DIR, "../framework_src/qwen_infer.exe"))
+MODEL_BIN = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b.bin"))
 
 # Global subprocess handler & lock for thread safety
 engine_process = None
@@ -44,7 +45,7 @@ def init_engine():
         # Start qwen_infer subprocess in framework_src working dir
         engine_process = subprocess.Popen(
             [os.path.abspath(ENGINE_EXE), os.path.abspath(MODEL_BIN)],
-            cwd="../framework_src",
+            cwd=os.path.abspath(os.path.join(BASE_DIR, "../framework_src")),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

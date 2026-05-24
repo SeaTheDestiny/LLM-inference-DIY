@@ -393,7 +393,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kWarpsM * kWarpsN)
 
     // SMEM swizzle: permute column within each 16-col K-tile to avoid bank conflicts
     // Applies to both K tiles (cols 0..15 and 16..31 independently)
-    static __device__ __forceinline__ int swizzle_j(int i, int j) {
+    auto swizzle_j = [](int i, int j) {
         if constexpr (kSwizzleA) {
             int ktile_base = (j / 16) * 16;           // 0 or 16
             int local_j = j - ktile_base;              // 0..15
@@ -402,9 +402,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kWarpsM * kWarpsN)
         } else {
             return j;
         }
-    }
-    constexpr int kNumWarps = kWarpsM * kWarpsN;
-    constexpr int kStage = 2;
+    };
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
@@ -422,7 +420,6 @@ __global__ void __launch_bounds__(WARP_SIZE * kWarpsM * kWarpsN)
 
     // SMEM with swizzle-friendly layout
     // layout: [kStage][kBM][BK*kWarpK + PAD]
-    constexpr int A_cols = BK * kWarpK;         // 32
     constexpr int A_sz = kBM * A_cols;           // 128×32 = 4096 per stage
     constexpr int B_sz = BK * kWarpK * kBN;      // 32×128 = 4096 per stage
     extern __shared__ half smem[];

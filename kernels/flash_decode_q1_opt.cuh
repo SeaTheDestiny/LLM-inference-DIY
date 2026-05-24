@@ -436,7 +436,8 @@ __global__ void __launch_bounds__(WARP_SIZE * kMaxWarps)
 fd_v5_fused_kernel(
     const half *Q, const half *K, const half *V,
     half *O_final,
-    int KV_seqlen) {
+    int KV_seqlen,
+    int stride = kHeadDim) {
 
     constexpr int kDpt = kHeadDim / WARP_SIZE;
     int tid = threadIdx.x;
@@ -468,7 +469,7 @@ fd_v5_fused_kernel(
             if (g_row >= KV_seqlen) break;
 
             half K_reg[kDpt];
-            FD_LDST64(K_reg[0], K[g_row * kHeadDim + lid * kDpt]);
+            FD_LDST64(K_reg[0], K[g_row * stride + lid * kDpt]);
 
             float dot = 0.0f;
             #pragma unroll
@@ -486,7 +487,7 @@ fd_v5_fused_kernel(
             row_sum = __fmaf_rn(row_sum, exp_diff, p);
 
             half V_reg[kDpt];
-            FD_LDST64(V_reg[0], V[g_row * kHeadDim + lid * kDpt]);
+            FD_LDST64(V_reg[0], V[g_row * stride + lid * kDpt]);
             #pragma unroll
             for (int i = 0; i < kDpt; i++)
                 O_acc[i] = __fmaf_rn(O_acc[i], exp_diff, p * __half2float(V_reg[i]));
@@ -549,7 +550,8 @@ __global__ void __launch_bounds__(WARP_SIZE * kNumWarps)
 fd_v5_split_stage1_kernel(
     const half *Q, const half *K, const half *V,
     half *O_partial, float *LSE,
-    int KV_seqlen, int num_chunks) {
+    int KV_seqlen, int num_chunks,
+    int stride = kHeadDim) {
 
     constexpr int kDpt = kHeadDim / WARP_SIZE;
     constexpr int kRowsPerWarp = kBc / kNumWarps;
@@ -582,7 +584,7 @@ fd_v5_split_stage1_kernel(
         if (g_row >= KV_seqlen) break;
 
         half K_reg[kDpt];
-        FD_LDST64(K_reg[0], K[g_row * kHeadDim + lid * kDpt]);
+        FD_LDST64(K_reg[0], K[g_row * stride + lid * kDpt]);
 
         float dot = 0.0f;
         #pragma unroll
@@ -600,7 +602,7 @@ fd_v5_split_stage1_kernel(
         row_sum = __fmaf_rn(row_sum, exp_diff, p);
 
         half V_reg[kDpt];
-        FD_LDST64(V_reg[0], V[g_row * kHeadDim + lid * kDpt]);
+        FD_LDST64(V_reg[0], V[g_row * stride + lid * kDpt]);
         #pragma unroll
         for (int i = 0; i < kDpt; i++)
             O_acc[i] = __fmaf_rn(O_acc[i], exp_diff, p * __half2float(V_reg[i]));

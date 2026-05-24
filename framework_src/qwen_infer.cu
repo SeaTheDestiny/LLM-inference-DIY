@@ -50,6 +50,9 @@ struct QwenWeights {
 #include "../kernels/swiglu.cuh"
 #include "../kernels/bias.cuh"
 #include "../kernels/argmax.cuh"
+#include "../kernels/hgemm_final.cuh"
+#include "../kernels/transpose.cuh"
+#include "../kernels/fused_qkv_rope_cache.cuh"
 
 // ============================================================
 // Main High-Performance Inference Engine
@@ -205,6 +208,18 @@ public:
         f.close();
         std::cout << "[SUCCESS] Weights fully loaded into VRAM." << std::endl;
         
+        // Transpose projection weights in-place for highly optimized HGEMV/HGEMM compatibility
+        std::cout << "Transposing projection weights for optimized HGEMV..." << std::endl;
+        for (unsigned int i = 0; i < config.num_layers; i++) {
+            transpose_weight_gpu(weights.qkv_w[i], 3 * config.hidden_size, config.hidden_size);
+            transpose_weight_gpu(weights.attn_proj_w[i], config.hidden_size, config.hidden_size);
+            transpose_weight_gpu(weights.ffn_w1[i], config.intermediate_size, config.hidden_size);
+            transpose_weight_gpu(weights.ffn_w2[i], config.intermediate_size, config.hidden_size);
+            transpose_weight_gpu(weights.ffn_proj_w[i], config.hidden_size, config.intermediate_size);
+        }
+        transpose_weight_gpu(weights.lm_head, config.vocab_size, config.hidden_size);
+        std::cout << "[SUCCESS] Weights successfully transposed." << std::endl;
+        
         // 3. Allocate KV Cache & Dynamic Activations
         size_t kv_cache_size = (size_t)config.num_layers * config.max_seqlen * config.hidden_size;
         d_kv_cache_k = alloc_gpu(kv_cache_size);
@@ -264,31 +279,30 @@ public:
         cudaFree(d_fd_lse);
     }
     
-    // Matrix Multiplication Helper using cuBLAS Tensor Cores
+    // High-performance Matrix Multiplication Helper using custom HGEMV for single token, with fallback to cuBLAS
     void gemm(half* out, const half* in, const half* weight, int m, int n, int k) {
-        float alpha = 1.0f;
-        float beta = 0.0f;
-        
-        // cuBLAS uses column-major order.
-        // We calculate C = A * B.
-        // In column-major, this is equivalent to C^T = B^T * A^T.
-        // Here, we want `out = in * weight^T` where:
-        //   - in: shape [m, k]
-        //   - weight: shape [n, k], so weight^T: shape [k, n]
-        //   - out: shape [m, n]
-        // In column-major, weight is [k, n] (transposed) or we configure transpose parameters.
-        cublasGemmEx(
-            cublas_handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k,
-            &alpha,
-            weight, CUDA_R_16F, k,
-            in, CUDA_R_16F, k,
-            &beta,
-            out, CUDA_R_16F, n,
-            CUBLAS_COMPUTE_32F,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP
-        );
+        if (m == 1) {
+            // Highly optimized custom matrix-vector HGEMV kernel
+            int threads = 256;
+            int blocks = (n + threads - 1) / threads;
+            hgemv_kernel<<<blocks, threads>>>(in, weight, out, n, k);
+        } else {
+            // Fallback to cuBLAS for large batch / matrix-matrix multiplication
+            float alpha = 1.0f;
+            float beta = 0.0f;
+            cublasGemmEx(
+                cublas_handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                n, m, k,
+                &alpha,
+                weight, CUDA_R_16F, n,
+                in, CUDA_R_16F, k,
+                &beta,
+                out, CUDA_R_16F, n,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP
+            );
+        }
     }
 
     // Execute single-token Decode step (greedy search)
@@ -311,19 +325,16 @@ public:
             // Add QKV bias
             add_bias_kernel<<<24, 256>>>(d_qkv, weights.qkv_b[i], 3 * config.hidden_size);
             
-            // Separate Q, K, V pointers
-            half* d_q = d_qkv;
-            half* d_k = d_qkv + config.hidden_size;
-            half* d_v = d_qkv + 2 * config.hidden_size;
-            
-            // Apply RoPE (Rotary Position Embeddings)
-            rope_kernel<<<16, 64>>>(d_q, d_k, pos, config.num_heads, 128);
-            
-            // Copy current K, V to KV Cache
-            // KV Cache format: [layers, max_seqlen, hidden_size]
-            size_t cache_offset = (size_t)i * config.max_seqlen * config.hidden_size + pos * config.hidden_size;
-            cudaMemcpy(d_kv_cache_k + cache_offset, d_k, config.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(d_kv_cache_v + cache_offset, d_v, config.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice);
+            // Fused separation, mathematically correct split-half RoPE rotation, and KV Cache write!
+            fused_qkv_rope_cache_kernel<<<config.num_heads, 64>>>(
+                d_qkv,
+                d_kv_cache_k + (size_t)i * config.max_seqlen * config.hidden_size,
+                d_kv_cache_v + (size_t)i * config.max_seqlen * config.hidden_size,
+                pos,
+                config.max_seqlen,
+                config.num_heads,
+                128
+            );
             
             // Execute attention over historic sequence using our optimized Flash Decoding!
             // Every head is computed in parallel
@@ -340,20 +351,20 @@ public:
             
             // Launch parallel Flash Decoding kernels for each head
             for (unsigned int h = 0; h < config.num_heads; h++) {
-                half* head_q = d_q + h * kHeadDim;
+                half* head_q = d_qkv + h * kHeadDim;
                 half* head_k_cache = cur_layer_cache_k + h * kHeadDim;
                 half* head_v_cache = cur_layer_cache_v + h * kHeadDim;
                 half* head_out = d_qkv_out + h * kHeadDim;
                 
                 if (num_chunks == 1) {
                     // Use Fused single-block Flash Decoding (sub-microsecond speed!)
-                    fd_v5_fused_kernel<kHeadDim, 32, 32><<<1, 256>>>(
-                        head_q, head_k_cache, head_v_cache, head_out, current_seqlen
+                    fd_v5_fused_kernel<kHeadDim, 8, 32><<<1, 256>>>(
+                        head_q, head_k_cache, head_v_cache, head_out, current_seqlen, config.hidden_size
                     );
                 } else {
                     // Use Split Stage1 + Stage2 Flash Decoding for long context lengths
                     fd_v5_split_stage1_kernel<kHeadDim, kBc, 8><<<num_chunks, 256>>>(
-                        head_q, head_k_cache, head_v_cache, d_fd_partial, d_fd_lse, current_seqlen, num_chunks
+                        head_q, head_k_cache, head_v_cache, d_fd_partial, d_fd_lse, current_seqlen, num_chunks, config.hidden_size
                     );
                     fd_opt_stage2_kernel<kHeadDim><<<1, 128>>>(
                         d_fd_partial, d_fd_lse, head_out, num_chunks

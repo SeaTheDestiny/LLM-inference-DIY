@@ -1,0 +1,30 @@
+# Compiled binaries
+*.exe
+*.o
+*.obj
+*.lib
+*.dll
+*.exp
+*.pdb
+
+# Python virtual environment
+.venv/
+
+# Model weights (large files)
+model_weights/*.bin
+model_weights/*.safetensors
+
+# Generated CSV / logs
+*.csv
+*.txt
+!README.md
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+
+# Python cache
+__pycache__/
+*.pyc

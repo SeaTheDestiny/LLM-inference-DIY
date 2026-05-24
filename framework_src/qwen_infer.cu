@@ -94,6 +94,7 @@ private:
     half* d_prefill_q;    // [NH*max_seqlen, headDim] gathered Q for FA
     half* d_prefill_k;    // [NH*max_seqlen, headDim] gathered K
     half* d_prefill_v;    // [NH*max_seqlen, headDim] gathered V
+    half* d_prefill_o;    // [NH*max_seqlen, headDim] FA output temp
     half* d_prefill_w1;   // [max_seqlen, IM]
     half* d_prefill_w2;   // [max_seqlen, IM]
     half* d_prefill_act;  // [max_seqlen, IM]
@@ -270,6 +271,7 @@ public:
         d_prefill_q    = alloc_gpu(NH * config.max_seqlen * 128);
         d_prefill_k    = alloc_gpu(NH * config.max_seqlen * 128);
         d_prefill_v    = alloc_gpu(NH * config.max_seqlen * 128);
+        d_prefill_o    = alloc_gpu(NH * config.max_seqlen * 128);
         d_prefill_w1   = alloc_gpu(config.max_seqlen * IM);
         d_prefill_w2   = alloc_gpu(config.max_seqlen * IM);
         d_prefill_act  = alloc_gpu(config.max_seqlen * IM);
@@ -388,15 +390,15 @@ public:
                     half* Qh = d_prefill_q + h * N * kHD;
                     half* Kh = d_prefill_k + h * N * kHD;
                     half* Vh = d_prefill_v + h * N * kHD;
-                    // FA output goes back to gathered buffer (overwrite Vh — OK, V no longer needed)
-                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Vh, N, NH);
+                    half* Oh = d_prefill_o + h * N * kHD;
+                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, NH);
                 }
                 cudaDeviceSynchronize();
             }
 
             // Scatter FA output back to interleaved d_prefill_out
             scatter_interleaved_kernel<kHD,256><<<(N*NH*kHD+255)/256, 256>>>(
-                d_prefill_v, d_prefill_out, N, NH, H);
+                d_prefill_o, d_prefill_out, N, NH, H);
             cudaDeviceSynchronize();
 
             // Output proj + residual
@@ -575,17 +577,14 @@ int main(int argc, char* argv[]) {
         
         if (prompt_tokens.empty()) continue;
         
-        // 1. FA Prefill: batch all but last token through Flash Attention
+        // 1. Prefill (sequential step — FA pending debug)
         int pos = 0;
-        int last_token;
-        if (prompt_tokens.size() > 1) {
-            std::vector<int> prefill_tokens(prompt_tokens.begin(), prompt_tokens.end() - 1);
-            engine.prefill(prefill_tokens, pos);
+        int last_token = prompt_tokens[0];
+        for (size_t i = 1; i < prompt_tokens.size(); i++) {
+            engine.step(last_token, pos);
+            pos++;
+            last_token = prompt_tokens[i];
         }
-        // Feed last token through step() to produce initial logits
-        last_token = prompt_tokens.back();
-        engine.step(last_token, pos);
-        pos++;
         
         // 2. Decode generation stage
         int max_new_tokens = 512;

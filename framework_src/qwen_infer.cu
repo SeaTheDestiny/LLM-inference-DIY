@@ -392,7 +392,7 @@ public:
                     half* Kh = d_prefill_k + h * N * kHD;
                     half* Vh = d_prefill_v + h * N * kHD;
                     half* Oh = d_prefill_o + h * N * kHD;
-                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, 1);  // QKV_head=1: per-head buffers
+                    fa<<<g,b,smem>>>(Qh,Kh,Vh,Oh,N,1,kHD,kHD,-1,-1,-1);  // QKV_head=1: per-head buffers
                 }
                 cudaDeviceSynchronize();
             }

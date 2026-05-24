@@ -365,17 +365,6 @@ function startTypewriter(bubble) {
 
     return { feed, done };
 }
-    bubble.classList.add("message-bubble");
-    bubble.innerHTML = formatText(text);
-    const info = document.createElement("div");
-    info.classList.add("message-info");
-    info.textContent = role === "user" ? "你" : "Qwen-Inference";
-    msgDiv.appendChild(bubble);
-    msgDiv.appendChild(info);
-    chatBody.appendChild(msgDiv);
-    scrollToBottom();
-    return bubble;
-}
 
 chatInput.addEventListener("input", function() {
     this.style.height = "auto";

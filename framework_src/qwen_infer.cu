@@ -370,13 +370,7 @@ public:
             }
             cudaDeviceSynchronize();
 
-            // Gather Q + K + V into per-head contiguous buffers
-            gather_q_from_qkv(d_prefill_qkv, d_prefill_q, N, NH, kHD);
-            gather_kv_from_cache(d_kv_cache_k + (size_t)l * config.max_seqlen * H,
-                                 d_prefill_k, N, NH, kHD);
-            gather_kv_from_cache(d_kv_cache_v + (size_t)l * config.max_seqlen * H,
-                                 d_prefill_v, N, NH, kHD);
-            cudaDeviceSynchronize();
+            // All gather eliminated: Q (stride_Q=3H), K/V (stride_KV=H) read directly
 
             // Flash Attention per head
             {
@@ -390,11 +384,11 @@ public:
                 half* kvk = d_kv_cache_k + (size_t)l * config.max_seqlen * H;
                 half* kvv = d_kv_cache_v + (size_t)l * config.max_seqlen * H;
                 for (int h = 0; h < NH; h++) {
-                    half* Qh = d_prefill_q + h * N * kHD;
+                    half* Qh = d_prefill_qkv + h * kHD;  // stride_Q=3H, direct from QKV projection
                     half* Kh = kvk + h * kHD;   // interleaved KV-cache, stride=H
                     half* Vh = kvv + h * kHD;
                     half* Oh = d_prefill_o + h * N * kHD;
-                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, 1, kHD, (int)H, 0, 0);
+                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Oh, N, 1, 3*(int)H, (int)H, 0, 0, 0);  // stride_Q=3H, K/V_ofs=0, Q_ofs=0
                 }
                 cudaDeviceSynchronize();
             }

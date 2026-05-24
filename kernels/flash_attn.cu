@@ -1889,7 +1889,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     int stride_Q  = kHeadDim,
     int stride_KV = kHeadDim,
     int K_ofs_override = -1,   // -1 = auto from QKV_head; 0 = per-head pointer
-    int V_ofs_override = -1
+    int V_ofs_override = -1, int Q_ofs_override = -1
     ) {
     constexpr int kThrA = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 128
@@ -1900,7 +1900,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
 
     // Per-head pointers: QKV_head=1 means Qh/Kh/Vh/Oh point to single head's data.
     // Offset = QKV_head * QKV_seqlen * kHeadDim works as a "skip past this head" offset.
-    int Q_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
+    int Q_ofs = (Q_ofs_override >= 0) ? Q_ofs_override + Tr * Br * stride_Q : QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
     int K_ofs = (K_ofs_override >= 0) ? K_ofs_override : QKV_head * QKV_seqlen * stride_KV;
     int V_ofs = (V_ofs_override >= 0) ? V_ofs_override : QKV_head * QKV_seqlen * stride_KV;
     int O_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;

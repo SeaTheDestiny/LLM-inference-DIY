@@ -1880,8 +1880,13 @@ template <
     >
 __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     flash_attn_tuned_A_kernel(half *Q, half *K, half *V,
+    // Runtime stride parameters: allow interleaved KV-cache access (like FD v5)
+    //   Default kHeadDim = per-head contiguous (bench mode, backward compat)
+    //   Set stride_KV = hidden_size for interleaved KV-cache [seqlen, numHeads*headDim]
                               half *O, int QKV_seqlen,
-                              int QKV_head) {
+                              int QKV_head,
+                              int stride_Q  = kHeadDim,
+                              int stride_KV = kHeadDim) {
     constexpr int kThrA = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 128
     constexpr int Bc = kMmaAtomN * kMmaTileSeqLenK * kWarpTileSeqLenK;  // 128
@@ -1889,10 +1894,12 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     const int Tc = div_ceil(QKV_seqlen, Bc);
     const int Tr = blockIdx.y;
 
-    int Q_ofs = QKV_head * QKV_seqlen * kHeadDim + Tr * Br * kHeadDim;
-    int K_ofs = QKV_head * QKV_seqlen * kHeadDim;
-    int V_ofs = QKV_head * QKV_seqlen * kHeadDim;
-    int O_ofs = QKV_head * QKV_seqlen * kHeadDim + Tr * Br * kHeadDim;
+    // Per-head pointers: QKV_head=1 means Qh/Kh/Vh/Oh point to single head's data.
+    // Offset = QKV_head * QKV_seqlen * kHeadDim works as a "skip past this head" offset.
+    int Q_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
+    int K_ofs = QKV_head * QKV_seqlen * stride_KV;
+    int V_ofs = QKV_head * QKV_seqlen * stride_KV;
+    int O_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
 
     constexpr int Q_sz = Br * (kMmaAtomK + kPadQ);        // 128*24=3072
     constexpr int K_sz = Bc * (kMmaAtomK + kPadK);        // 128*24=3072
@@ -1944,11 +1951,11 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
         {
             if (Tr * Br + ldQ_r < QKV_seqlen) {
                 uint32_t sp = Q_base + (0 * Q_sz + ldQ_r * (kMmaAtomK + kPadQ) + ldQ_c) * sizeof(half);
-                CP_ASYNC_CG(sp, &Q[Q_ofs + ldQ_r * kHeadDim + ldQ_c], 16);
+                CP_ASYNC_CG(sp, &Q[Q_ofs + ldQ_r * stride_Q + ldQ_c], 16);
             }
             if (j * Bc + ldK_r < QKV_seqlen) {
                 uint32_t sp = K_base + (0 * K_sz + ldK_r * (kMmaAtomK + kPadK) + ldK_c) * sizeof(half);
-                CP_ASYNC_CG(sp, &K[K_ofs + j * Bc * kHeadDim + ldK_r * kHeadDim + ldK_c], 16);
+                CP_ASYNC_CG(sp, &K[K_ofs + j * Bc * stride_KV + ldK_r * stride_KV + ldK_c], 16);
             }
             CP_ASYNC_COMMIT_GROUP();
             CP_ASYNC_WAIT_GROUP(0);
@@ -1964,12 +1971,12 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
                 int ngd = (dt + 1) * kMmaAtomK + ldQ_c;
                 if (Tr * Br + ldQ_r < QKV_seqlen) {
                     uint32_t sp = Q_base + (nxt * Q_sz + ldQ_r * (kMmaAtomK + kPadQ) + ldQ_c) * sizeof(half);
-                    CP_ASYNC_CG(sp, &Q[Q_ofs + ldQ_r * kHeadDim + ngd], 16);
+                    CP_ASYNC_CG(sp, &Q[Q_ofs + ldQ_r * stride_Q + ngd], 16);
                 }
                 ngd = (dt + 1) * kMmaAtomK + ldK_c;
                 if (j * Bc + ldK_r < QKV_seqlen) {
                     uint32_t sp = K_base + (nxt * K_sz + ldK_r * (kMmaAtomK + kPadK) + ldK_c) * sizeof(half);
-                    CP_ASYNC_CG(sp, &K[K_ofs + j * Bc * kHeadDim + ldK_r * kHeadDim + ngd], 16);
+                    CP_ASYNC_CG(sp, &K[K_ofs + j * Bc * stride_KV + ldK_r * stride_KV + ngd], 16);
                 }
                 CP_ASYNC_COMMIT_GROUP();
             }
@@ -2056,7 +2063,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
         for (int stg = 0; stg < (kStage - 1); ++stg) {
             if (j * Bc + ldV_r < QKV_seqlen) {
                 uint32_t sp = V_base + (stg * V_sz + ldV_r * (kMmaAtomN * 2 + kPadV) + ldV_c) * sizeof(half);
-                CP_ASYNC_CG(sp, &V[V_ofs + j * Bc * kHeadDim + ldV_r * kHeadDim + stg * (kMmaAtomN * 2) + ldV_c], 16);
+                CP_ASYNC_CG(sp, &V[V_ofs + j * Bc * stride_KV + ldV_r * stride_KV + stg * (kMmaAtomN * 2) + ldV_c], 16);
             }
             CP_ASYNC_COMMIT_GROUP();
         }
@@ -2073,7 +2080,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
                 int ngd = ((jv / 2 + 1) * kMmaAtomN * 2) + ldV_c;
                 if (j * Bc + ldV_r < QKV_seqlen) {
                     uint32_t sp = V_base + (nxt_v * V_sz + ldV_r * (kMmaAtomN * 2 + kPadV) + ldV_c) * sizeof(half);
-                    CP_ASYNC_CG(sp, &V[V_ofs + j * Bc * kHeadDim + ldV_r * kHeadDim + ngd], 16);
+                    CP_ASYNC_CG(sp, &V[V_ofs + j * Bc * stride_KV + ldV_r * stride_KV + ngd], 16);
                 }
                 CP_ASYNC_COMMIT_GROUP();
             }
@@ -2157,9 +2164,9 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
             int gr0 = Tr * Br + o_br + lid / 4;
             int gr8 = Tr * Br + o_br + lid / 4 + 8;
             if (gr0 < QKV_seqlen)
-                LDST128BITS(O[O_ofs + (o_br + lid / 4) * kHeadDim + o_d]) = LDST128BITS(Z0[0]);
+                LDST128BITS(O[O_ofs + (o_br + lid / 4) * stride_Q + o_d]) = LDST128BITS(Z0[0]);
             if (gr8 < QKV_seqlen)
-                LDST128BITS(O[O_ofs + (o_br + lid / 4 + 8) * kHeadDim + o_d]) = LDST128BITS(Z1[0]);
+                LDST128BITS(O[O_ofs + (o_br + lid / 4 + 8) * stride_Q + o_d]) = LDST128BITS(Z1[0]);
         }
     }
 }

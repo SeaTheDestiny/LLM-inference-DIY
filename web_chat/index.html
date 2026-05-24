@@ -433,7 +433,9 @@ async function sendMessage() {
                     if (dataStr === "[DONE]") break;
                     try {
                         const p = JSON.parse(dataStr);
-                        fullResponse += p.text;
+                        // Backend now sends the FULL accumulated text each event
+                        // (not incremental), so we replace, not append.
+                        fullResponse = p.text;
 
                         if (firstToken && p.text) {
                             firstToken = false;

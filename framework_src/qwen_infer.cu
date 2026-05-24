@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+// Global volatile variable to prevent host compiler from optimizing away memory copies
+volatile float prevent_opt = 0.0f;
+
 // Include our optimized Flash Decoding kernels from kernels directory
 #include "../kernels/flash_decode_q1_opt.cuh"
 
@@ -312,7 +315,13 @@ public:
         cudaFree(d_fd_partial);
         cudaFree(d_fd_lse);
     }
-    
+    void reset() {
+        size_t kv_cache_size = (size_t)config.num_layers * config.max_seqlen * config.hidden_size;
+        cudaMemset(d_kv_cache_k, 0, kv_cache_size * sizeof(half));
+        cudaMemset(d_kv_cache_v, 0, kv_cache_size * sizeof(half));
+        cudaDeviceSynchronize();
+    }
+
     // High-performance Matrix Multiplication: HGEMV (m=1) / HGEMM (m>1)
     void gemm(half* out, const half* in, const half* weight, int m, int n, int k) {
         if (m == 1) {
@@ -320,18 +329,13 @@ public:
             int blocks = (n + threads - 1) / threads;
             hgemv_kernel<<<blocks, threads>>>(in, weight, out, n, k);
         } else {
-            // Our own HGEMM: A[m,k] row-major, B[k,n] row-major
-            // weight is already [k, n] row-major (we transposed it at load time)
-            constexpr int BM=128, BN=128, WM=2, WN=4, WK=2;
-            constexpr int A_sz = BM * (16 * WK);
-            constexpr int B_sz = (16 * WK) * BN;
-            int smem = 2 * (A_sz + B_sz) * sizeof(half);
-            int MT = (m + BM - 1) / BM;
-            int NT = (n + BN - 1) / BN;
-            dim3 g(NT, MT), b(WARP_SIZE * WM * WN);
-            auto fn = hgemm_opt_kernel<BM, BN, WM, WN, BM/16/WM, BN/8/WN, WK, true, 2, 0>;
-            cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-            fn<<<g, b, smem>>>((half*)in, (half*)weight, out, m, n, k);
+            // Use ultra-robust and stable cuBLAS for batched prefill GEMM (m > 1)
+            half alpha = __float2half(1.0f);
+            half beta  = __float2half(0.0f);
+            cublasStatus_t status = cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, weight, n, in, k, &beta, out, n);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                std::cerr << "[ERROR] cublasHgemm failed with status: " << status << std::endl;
+            }
         }
     }
 
@@ -347,19 +351,56 @@ public:
         constexpr int kHD = 128;
         constexpr float eps = 1e-6f;
 
+        // Helper function to print first 8 values to std::cerr
+        auto dump_first_8 = [](const std::string& name, half* d_ptr) {
+            half tmp[8];
+            cudaMemcpy(tmp, d_ptr, 8 * sizeof(half), cudaMemcpyDeviceToHost);
+            std::cerr << "[DUMP] " << name << ": ";
+            for (int i = 0; i < 8; i++) {
+                std::cerr << __half2float(tmp[i]) << " ";
+            }
+            std::cerr << std::endl;
+        };
+
+#define CHECK_CUDA_ERR(msg) \
+        { \
+            cudaError_t err = cudaGetLastError(); \
+            if (err != cudaSuccess) { \
+                std::cerr << "[ERROR] " << msg << ": " << cudaGetErrorString(err) << std::endl; \
+            } \
+        }
+
         // 1. Embed all tokens
-        for (int i = 0; i < N; i++)
+        for (int i = 0; i < N; i++) {
             cudaMemcpy(d_prefill_x + (size_t)i * H,
                        weights.wte + (size_t)tokens[i] * H,
                        H * sizeof(half), cudaMemcpyDeviceToDevice);
+        }
+        cudaDeviceSynchronize();
+        CHECK_CUDA_ERR("Embed tokens");
 
         // 2. Layers
         for (unsigned int l = 0; l < config.num_layers; l++) {
+            if (l == 0) {
+                dump_first_8("d_prefill_x (input)", d_prefill_x);
+            }
+
             // --- Attention ---
-            for (int i = 0; i < N; i++)
+            for (int i = 0; i < N; i++) {
                 rmsnorm_kernel<<<1,512>>>(d_prefill_norm + (size_t)i * H,
                     d_prefill_x + (size_t)i * H, weights.ln_1[l], H, eps);
+            }
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("RMSNorm 1");
+
             gemm(d_prefill_qkv, d_prefill_norm, weights.qkv_w[l], N, 3*H, H);
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("QKV GEMM");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_norm", d_prefill_norm);
+                dump_first_8("d_prefill_qkv (before bias)", d_prefill_qkv);
+            }
 
             for (int i = 0; i < N; i++) {
                 add_bias_kernel<<<24,256>>>(d_prefill_qkv + (size_t)i * 3 * H, weights.qkv_b[l], 3*H);
@@ -369,6 +410,11 @@ public:
                     i, config.max_seqlen, NH, kHD);
             }
             cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("QKV Bias + RoPE");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_qkv (after rope)", d_prefill_qkv);
+            }
 
             // Gather Q + K + V into per-head contiguous buffers
             gather_q_from_qkv(d_prefill_qkv, d_prefill_q, N, NH, kHD);
@@ -377,6 +423,13 @@ public:
             gather_kv_from_cache(d_kv_cache_v + (size_t)l * config.max_seqlen * H,
                                  d_prefill_v, N, NH, kHD);
             cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("Gather QKV");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_q", d_prefill_q);
+                dump_first_8("d_prefill_k", d_prefill_k);
+                dump_first_8("d_prefill_v", d_prefill_v);
+            }
 
             // Flash Attention per head
             {
@@ -387,39 +440,103 @@ public:
                 int smem = 2*(Q_sz+K_sz)*sizeof(half);
                 auto fa = flash_attn_tuned_A_kernel<kHD,16,8,16,8,1,1,16,1,0,8,8,8,2,1>;
                 cudaFuncSetAttribute(fa, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+
                 for (int h = 0; h < NH; h++) {
                     half* Qh = d_prefill_q + h * N * kHD;
                     half* Kh = d_prefill_k + h * N * kHD;
                     half* Vh = d_prefill_v + h * N * kHD;
                     half* Oh = d_prefill_o + h * N * kHD;
-                    fa<<<g,b,smem>>>(Qh,Kh,Vh,Oh,N,1,kHD,kHD,-1,-1,-1);  // QKV_head=1: per-head buffers
+                    fa<<<g,b,smem>>>(Qh,Kh,Vh,Oh,N,1,kHD,kHD,0,0,0,0);  // all ofs_override=0: per-head pointers
                 }
                 cudaDeviceSynchronize();
+                CHECK_CUDA_ERR("Flash Attention");
+            }
+
+            if (l == 0) {
+                dump_first_8("d_prefill_o (FA output)", d_prefill_o);
             }
 
             // Scatter FA output back to interleaved d_prefill_out
             scatter_interleaved_kernel<kHD,256><<<(N*NH*kHD+255)/256, 256>>>(
                 d_prefill_o, d_prefill_out, N, NH, H);
             cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("Scatter Interleaved");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_out", d_prefill_out);
+            }
+
+            if (l == 0) {
+                dump_first_8("weights.attn_proj_w[0]", weights.attn_proj_w[0]);
+            }
 
             // Output proj + residual
             gemm(d_prefill_norm, d_prefill_out, weights.attn_proj_w[l], N, H, H);
-            for (int i = 0; i < N; i++)
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("Attn Proj GEMM");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_norm (after attn_proj gemm)", d_prefill_norm);
+            }
+
+            for (int i = 0; i < N; i++) {
                 add_bias_kernel<<<8,256>>>(d_prefill_x + (size_t)i * H, d_prefill_norm + (size_t)i * H, H);
+            }
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("Attn Residual Bias");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_x (after attn residual)", d_prefill_x);
+            }
 
             // --- FFN ---
-            for (int i = 0; i < N; i++)
+            for (int i = 0; i < N; i++) {
                 rmsnorm_kernel<<<1,512>>>(d_prefill_norm + (size_t)i * H,
                     d_prefill_x + (size_t)i * H, weights.ln_2[l], H, eps);
+            }
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("RMSNorm 2");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_norm (after ln2 rmsnorm)", d_prefill_norm);
+            }
+
             gemm(d_prefill_w1, d_prefill_norm, weights.ffn_w1[l], N, IM, H);
             gemm(d_prefill_w2, d_prefill_norm, weights.ffn_w2[l], N, IM, H);
-            for (int i = 0; i < N; i++)
+            cudaDeviceSynchronize();
+            CHECK_CUDA_ERR("FFN GEMM 1/2");
+
+            if (l == 0) {
+                dump_first_8("d_prefill_w1", d_prefill_w1);
+                dump_first_8("d_prefill_w2", d_prefill_w2);
+            }
+
+            for (int i = 0; i < N; i++) {
                 swiglu_kernel<<<22,256>>>(d_prefill_act + (size_t)i * IM,
                     d_prefill_w1 + (size_t)i * IM, d_prefill_w2 + (size_t)i * IM, IM);
+            }
+            cudaDeviceSynchronize();
+
+            if (l == 0) {
+                dump_first_8("d_prefill_act (swiglu)", d_prefill_act);
+            }
+
             gemm(d_prefill_proj, d_prefill_act, weights.ffn_proj_w[l], N, H, IM);
-            for (int i = 0; i < N; i++)
+            cudaDeviceSynchronize();
+
+            if (l == 0) {
+                dump_first_8("d_prefill_proj", d_prefill_proj);
+            }
+
+            for (int i = 0; i < N; i++) {
                 add_bias_kernel<<<8,256>>>(d_prefill_x + (size_t)i * H,
                     d_prefill_proj + (size_t)i * H, H);
+            }
+            cudaDeviceSynchronize();
+
+            if (l == 0) {
+                dump_first_8("d_prefill_x (output of L0)", d_prefill_x);
+            }
         }
         pos = N;
     }
@@ -490,6 +607,20 @@ public:
                     );
                 }
             }
+            cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                std::cerr << "[ERROR] L" << i << " CUDA kernel execution failed: " << cudaGetErrorString(err) << std::endl;
+            }
+            if (i == 0) {
+                half tmp[8];
+                cudaMemcpy(tmp, d_qkv_out, 8 * sizeof(half), cudaMemcpyDeviceToHost);
+                std::cerr << "[STEP_DUMP] L0 d_qkv_out: ";
+                for (int idx = 0; idx < 8; idx++) {
+                    std::cerr << __half2float(tmp[idx]) << " ";
+                }
+                std::cerr << std::endl;
+            }
             
             // Attention Output Linear projection (c_proj)
             gemm(d_attn_proj, d_qkv_out, weights.attn_proj_w[i], 1, config.hidden_size, config.hidden_size);
@@ -555,6 +686,7 @@ int main(int argc, char* argv[]) {
         
         if (line.empty() || line == "exit") break;
         if (line == "reset") {
+            engine.reset();
             std::cout << "[RESET_DONE]" << std::endl;
             continue;
         }
@@ -578,24 +710,26 @@ int main(int argc, char* argv[]) {
         
         if (prompt_tokens.empty()) continue;
         
-        // 1. Prefill stage (step-by-step for stability; FA prefill in prefill() for future)
+        // 1. FA Prefill: batch through causal Flash Attention
         int pos = 0;
-        int last_token = prompt_tokens[0];
-        for (size_t i = 1; i < prompt_tokens.size(); i++) {
-            engine.step(last_token, pos);
-            pos++;
-            last_token = prompt_tokens[i];
+        int last_token;
+        if (prompt_tokens.size() > 1) {
+            std::vector<int> prefill_tokens(prompt_tokens.begin(), prompt_tokens.end() - 1);
+            engine.prefill(prefill_tokens, pos);
         }
+        last_token = prompt_tokens.back();
         
         // 2. Decode generation stage
         int max_new_tokens = 512;
+        // Sync after prefill to ensure all kernels complete cleanly
+        cudaDeviceSynchronize();
         std::cout << "[GENERATION_START]" << std::endl;
         
         for (int step_idx = 0; step_idx < max_new_tokens; step_idx++) {
             int next_token = engine.step(last_token, pos);
             pos++;
             
-            // Qwen special tokens: 151645 is <|im_end|>, 151643 is <|endoftext|>
+            // Qwen ChatML stop tokens: 151645=<|im_end|>, 151643=<|endoftext|>
             if (next_token == 151645 || next_token == 151643) {
                 break;
             }
@@ -604,6 +738,8 @@ int main(int argc, char* argv[]) {
             std::cout << next_token << std::endl;
             last_token = next_token;
         }
+        // Ensure all GPU kernels finish before next turn (prevents async overlap corruption)
+        cudaDeviceSynchronize();
         std::cout << "[GENERATION_END]" << std::endl;
     }
     

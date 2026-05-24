@@ -1,4 +1,5 @@
 #pragma once
+#define FLASH_ATTN_CAUSAL
 #include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -1889,7 +1890,8 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     int stride_Q  = kHeadDim,
     int stride_KV = kHeadDim,
     int K_ofs_override = -1,   // -1 = auto from QKV_head; 0 = per-head pointer
-    int V_ofs_override = -1, int Q_ofs_override = -1
+    int V_ofs_override = -1, int Q_ofs_override = -1,
+    int O_ofs_override = -1
     ) {
     constexpr int kThrA = WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK;
     constexpr int Br = kMmaAtomM * kMmaTileSeqLenQ * kWarpTileSeqLenQ;  // 128
@@ -1903,7 +1905,8 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
     int Q_ofs = (Q_ofs_override >= 0) ? Q_ofs_override + Tr * Br * stride_Q : QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
     int K_ofs = (K_ofs_override >= 0) ? K_ofs_override : QKV_head * QKV_seqlen * stride_KV;
     int V_ofs = (V_ofs_override >= 0) ? V_ofs_override : QKV_head * QKV_seqlen * stride_KV;
-    int O_ofs = QKV_head * QKV_seqlen * stride_Q  + Tr * Br * stride_Q;
+    int O_ofs = (O_ofs_override >= 0) ? O_ofs_override + Tr * Br * stride_Q
+              : QKV_head * QKV_seqlen * stride_Q + Tr * Br * stride_Q;
 
     constexpr int Q_sz = Br * (kMmaAtomK + kPadQ);        // 128*24=3072
     constexpr int K_sz = Bc * (kMmaAtomK + kPadK);        // 128*24=3072
@@ -2016,14 +2019,14 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
         for (int kt = 0; kt < kWarpTileSeqLenK; kt++) {
             half *hp0 = reinterpret_cast<half *>(&R_S[0][kt][0]);
             half *hp1 = reinterpret_cast<half *>(&R_S[0][kt][1]);
-            int q0 = wQP * kMmaAtomM + lid / 4;
+            int q0 = Tr * Br + wQP * kMmaAtomM + lid / 4;
             int q1 = q0 + kMmaAtomM / 2;
             int k0 = j * Bc + kt * kMmaAtomN + (lid % 4) * 2;
             int k1 = k0 + 1;
-            if (k0 > q0) hp0[0] = __float2half(-INFINITY);
-            if (k1 > q0) hp0[1] = __float2half(-INFINITY);
-            if (k0 > q1) hp1[0] = __float2half(-INFINITY);
-            if (k1 > q1) hp1[1] = __float2half(-INFINITY);
+            if (k0 > q0) hp0[0] = __float2half(-65500.0f);
+            if (k1 > q0) hp0[1] = __float2half(-65500.0f);
+            if (k0 > q1) hp1[0] = __float2half(-65500.0f);
+            if (k1 > q1) hp1[1] = __float2half(-65500.0f);
         }
 #endif
         float rm_new[2] = {-INFINITY, -INFINITY};

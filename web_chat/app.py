@@ -4,8 +4,7 @@ import time
 import json
 import subprocess
 import threading
-from flask import Flask, request, Response, render_template, send_from_directory
-from transformers import AutoTokenizer
+from flask import Flask, request, Response, render_template
 
 app = Flask(__name__, static_folder=".", template_folder=".")
 
@@ -24,6 +23,7 @@ def get_tokenizer():
     global tokenizer
     if tokenizer is None:
         print("[WEB_SERVER] Loading Qwen official tokenizer from local weights directory...")
+        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
         print("[WEB_SERVER] Tokenizer loaded successfully.")
     return tokenizer
@@ -43,24 +43,26 @@ def init_engine():
             sys.exit(1)
             
         # Start qwen_infer subprocess in framework_src working dir
+        # Merge stderr → stdout to avoid pipe buffer deadlock:
+        # The C++ engine writes extensive [DUMP]/[STEP_DUMP] debug output to stderr,
+        # which would fill the pipe and block the subprocess if not consumed.
         engine_process = subprocess.Popen(
             [os.path.abspath(ENGINE_EXE), os.path.abspath(MODEL_BIN)],
             cwd=os.path.abspath(os.path.join(BASE_DIR, "../framework_src")),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1
         )
         
-        # Read stdout until [ENGINE_READY] is printed
+        # Read stdout (which now includes merged stderr) until [ENGINE_READY] is printed
         print("[WEB_SERVER] Waiting for CUDA GPU VRAM initialization and weights loading...")
         while True:
             line = engine_process.stdout.readline()
             if not line:
-                # Subprocess exited unexpectedly
-                stderr_output = engine_process.stderr.read()
-                print(f"[ERROR] Engine exited during startup. Stderr:\n{stderr_output}")
+                # Subprocess exited unexpectedly (stdout closed)
+                print("[ERROR] Engine exited unexpectedly during startup. Check framework_src/stderr.txt for details.")
                 sys.exit(1)
             print(line.strip())
             if "[ENGINE_READY]" in line:
@@ -91,17 +93,19 @@ def chat():
     
     tok = get_tokenizer()
     
-    # 1. Format prompt with official Qwen template structure
-    # Standard format: "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    # 1. Build prompt in TEXT-LEVEL ChatML format.
+    #    Qwen's tiktoken tokenizer correctly maps <|im_start|> → 151644
+    #    and <|im_end|> → 151645 as special tokens when encoding the full text.
+    #    Token-level assembly with allowed_special=set() risks BPE mismatches.
     formatted_prompt = ""
     for msg in messages:
         role = msg["role"]
         content = msg["content"]
         formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    # End with assistant prompt start
+    # End with assistant prompt start (NO <|im_end|> — the model completes it)
     formatted_prompt += "<|im_start|>assistant\n"
     
-    # 2. Encode to Token IDs
+    # 2. Encode the full prompt text → tokenizer handles special tokens natively
     token_ids = tok.encode(formatted_prompt)
     token_str = " ".join(str(tid) for tid in token_ids)
     print(f"[WEB_SERVER] Encoded prompt tokens ({len(token_ids)}): {token_str[:80]}...")
@@ -124,6 +128,11 @@ def chat():
             t_start = time.perf_counter()
             t_first = None
             token_count = 0
+            # Accumulate all generated tokens so we can decode them TOGETHER.
+            # Decoding one token at a time (tok.decode([t])) corrupts multi-byte
+            # characters (Chinese, emoji, etc.) that span multiple tokens —
+            # each partial token becomes "�", contaminating the next turn's context.
+            all_tokens = []
 
             engine_process.stdin.write(token_str + "\n")
             engine_process.stdin.flush()
@@ -144,15 +153,22 @@ def chat():
                 # Each line is one token ID
                 if line.isdigit() or (line.startswith('-') and line[1:].isdigit()):
                     t = int(line)
+                    # Stop at ChatML end tokens per Qwen spec:
+                    # 151645 = <|im_end|>, 151643 = <|endoftext|>
+                    if t in (151643, 151645):
+                        break
                     token_count += 1
                     if t_first is None:
                         t_first = time.perf_counter()
-                    decoded = tok.decode([t])
+                    all_tokens.append(t)
+                    # Decode ALL accumulated tokens together to preserve
+                    # multi-byte character integrity across token boundaries.
+                    full_text = tok.decode(all_tokens)
                     elapsed = time.perf_counter() - t_start
                     tps = token_count / elapsed if elapsed > 0 else 0
                     ttf_ms = (t_first - t_start) * 1000 if t_first else 0
                     ctx_used = prompt_len + token_count
-                    yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1), 'ctx_used':ctx_used, 'ctx_max':ctx_max})}\n\n"
+                    yield f"data: {json.dumps({'text':full_text, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1), 'ctx_used':ctx_used, 'ctx_max':ctx_max})}\n\n"
 
             yield "data: [DONE]\n\n"
             

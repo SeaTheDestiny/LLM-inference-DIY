@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import subprocess
-from transformers import AutoTokenizer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"))
@@ -10,7 +9,31 @@ ENGINE_EXE = os.path.abspath(os.path.join(BASE_DIR, "framework_src/qwen_infer.ex
 MODEL_BIN = os.path.abspath(os.path.join(BASE_DIR, "model_weights/qwen_1.8b.bin"))
 
 def main():
+    print(f"[TEST] Launching engine: {ENGINE_EXE}...")
+    proc = subprocess.Popen(
+        [ENGINE_EXE, MODEL_BIN],
+        cwd=os.path.dirname(ENGINE_EXE),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    # Read until [ENGINE_READY]
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            print("[ERROR] Engine exited during startup.")
+            sys.exit(1)
+        line = line.strip()
+        print(f"Engine Log: {line}")
+        if "[ENGINE_READY]" in line:
+            break
+
+    # Now load tokenizer (lazy import to prevent DLL pollution before subprocess starts)
     print("[TEST] Loading tokenizer...")
+    from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     print("[TEST] Tokenizer loaded.")
 
@@ -26,35 +49,14 @@ def main():
     token_str = " ".join(str(tid) for tid in token_ids)
     print(f"[TEST] Encoded prompt tokens: {token_str}")
 
-    print(f"[TEST] Launching engine: {ENGINE_EXE}...")
-    proc = subprocess.Popen(
-        [ENGINE_EXE, MODEL_BIN],
-        cwd=os.path.dirname(ENGINE_EXE),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
-
-    # Read until [ENGINE_READY]
-    while True:
-        line = proc.stdout.readline()
-        if not line:
-            print("[ERROR] Engine exited during startup.")
-            print(proc.stderr.read())
-            sys.exit(1)
-        line = line.strip()
-        print(f"Engine Log: {line}")
-        if "[ENGINE_READY]" in line:
-            break
-
     # Send reset
     print("[TEST] Sending reset...")
     proc.stdin.write("reset\n")
     proc.stdin.flush()
     while True:
-        line = proc.stdout.readline().strip()
+        line = proc.stdout.readline()
+        if not line:
+            break
         if "[RESET_DONE]" in line:
             break
 
@@ -80,6 +82,7 @@ def main():
                 tokens = [int(t) for t in line.split() if t.isdigit()]
                 generated_tokens.extend(tokens)
             break
+
         if started and line:
             tokens = [int(t) for t in line.split() if t.isdigit()]
             generated_tokens.extend(tokens)

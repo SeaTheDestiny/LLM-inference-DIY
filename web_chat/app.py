@@ -106,56 +106,60 @@ def chat():
     token_str = " ".join(str(tid) for tid in token_ids)
     print(f"[WEB_SERVER] Encoded prompt tokens ({len(token_ids)}): {token_str[:80]}...")
     
-    # 3. Stream Generator
+    # 3. Stream Generator with timing metrics
     def generate():
         global engine_process
         init_engine()
-        
+
         with engine_lock:
-            # 1. Reset KV cache of C++ engine
             engine_process.stdin.write("reset\n")
             engine_process.stdin.flush()
-            
-            # Read and discard until C++ reports [RESET_DONE]
             while True:
                 line = engine_process.stdout.readline().strip()
                 if "[RESET_DONE]" in line:
                     break
-            
-            # 2. Send prompt token IDs
+
+            t_start = time.perf_counter()
+            t_first = None
+            token_count = 0
+
             engine_process.stdin.write(token_str + "\n")
             engine_process.stdin.flush()
-            
-            # 3. Read generated output stream from C++ stdout
-            # The C++ engine outputs generated token IDs separated by spaces
-            # between [GENERATION_START] and [GENERATION_END]
+
             while True:
                 line = engine_process.stdout.readline()
                 if not line:
                     break
-                
                 line = line.strip()
+
                 if "[GENERATION_START]" in line:
-                    # Strip generation start tag and keep residual token IDs if any
                     line = line.replace("[GENERATION_START]", "").strip()
-                
                 if "[GENERATION_END]" in line:
-                    # Strip end tag and break
                     line = line.replace("[GENERATION_END]", "").strip()
                     if line:
-                        tokens = [int(t) for t in line.split() if t.isdigit()]
+                        tokens = [int(t) for t in line.split() if t.lstrip('-').isdigit()]
                         for t in tokens:
-                            decoded_text = tok.decode([t])
-                            yield f"data: {json.dumps({'text': decoded_text})}\n\n"
+                            token_count += 1
+                            if t_first is None:
+                                t_first = time.perf_counter()
+                            decoded = tok.decode([t])
+                            elapsed = time.perf_counter() - t_start
+                            tps = token_count / elapsed if elapsed > 0 else 0
+                            ttf_ms = (t_first - t_start) * 1000 if t_first else 0
+                            yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
                     break
-                
                 if line:
-                    tokens = [int(t) for t in line.split() if t.isdigit()]
+                    tokens = [int(t) for t in line.split() if t.lstrip('-').isdigit()]
                     for t in tokens:
-                        decoded_text = tok.decode([t])
-                        # Stream decoded chunk back to browser
-                        yield f"data: {json.dumps({'text': decoded_text})}\n\n"
-                        
+                        token_count += 1
+                        if t_first is None:
+                            t_first = time.perf_counter()
+                        decoded = tok.decode([t])
+                        elapsed = time.perf_counter() - t_start
+                        tps = token_count / elapsed if elapsed > 0 else 0
+                        ttf_ms = (t_first - t_start) * 1000 if t_first else 0
+                        yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
+
             yield "data: [DONE]\n\n"
             
     return Response(generate(), mimetype="text/event-stream")

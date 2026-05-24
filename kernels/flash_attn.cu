@@ -1,3 +1,4 @@
+#pragma once
 #include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -11,31 +12,43 @@
 #include <vector>
 using namespace nvcuda;
 
+#ifndef WARP_SIZE
 #define WARP_SIZE 32
+#endif
 #define DEVICE_INLINE __device__ inline
 #define HOST_DEVICE_INLINE __device__ __host__ inline
 #define INT4(value) (reinterpret_cast<int4 *>(&(value))[0])
 #define FLOAT4(value) (reinterpret_cast<float4 *>(&(value))[0])
 #define HALF2(value) (reinterpret_cast<half2 *>(&(value))[0])
 #define BFLOAT2(value) (reinterpret_cast<__nv_bfloat162 *>(&(value))[0])
+#ifndef LDST32BITS
 #define LDST32BITS(value) (reinterpret_cast<half2 *>(&(value))[0])
+#endif
 #define LDST64BITS(value) (reinterpret_cast<float2 *>(&(value))[0])
+#ifndef LDST128BITS
 #define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
+#endif
 // gmem -> smem
+#ifndef CP_ASYNC_COMMIT_GROUP
 #define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
+#endif
 #define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
+#ifndef CP_ASYNC_WAIT_GROUP
 #define CP_ASYNC_WAIT_GROUP(n)                                                 \
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n))
+#endif
 // ca(cache all, L1 + L2): support 4, 8, 16 bytes, cg(cache global, L2): only
 // support 16 bytes.
 #define CP_ASYNC_CA(dst, src, bytes)                                           \
   asm volatile(                                                                \
       "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst),       \
       "l"(src), "n"(bytes))
+#ifndef CP_ASYNC_CG
 #define CP_ASYNC_CG(dst, src, bytes)                                           \
   asm volatile(                                                                \
       "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst),       \
       "l"(src), "n"(bytes))
+#endif
 // smem -> gmem: requires sm_90 or higher.
 #define CP_ASYNC_BULK_COMMIT_GROUP()                                           \
   asm volatile("cp.async.bulk.commit_group;\n" ::)
@@ -56,20 +69,24 @@ using namespace nvcuda;
   asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"    \
                : "=r"(R0), "=r"(R1)                                            \
                : "r"(addr))
+#ifndef LDMATRIX_X4
 #define LDMATRIX_X4(R0, R1, R2, R3, addr)                                      \
   asm volatile(                                                                \
       "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"     \
       : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3)                                 \
       : "r"(addr))
+#endif
 #define LDMATRIX_X1_T(R, addr)                                                 \
   asm volatile("ldmatrix.sync.aligned.x1.trans.m8n8.shared.b16 {%0}, [%1];\n"  \
                : "=r"(R)                                                       \
                : "r"(addr))
+#ifndef LDMATRIX_X2_T
 #define LDMATRIX_X2_T(R0, R1, addr)                                            \
   asm volatile(                                                                \
       "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n"       \
       : "=r"(R0), "=r"(R1)                                                     \
       : "r"(addr))
+#endif
 #define LDMATRIX_X4_T(R0, R1, R2, R3, addr)                                    \
   asm volatile(                                                                \
       "ldmatrix.sync.aligned.x4.trans.m8n8.shared.b16 {%0, %1, %2, %3}, "      \

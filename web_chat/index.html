@@ -240,7 +240,9 @@
         <span class="metric-sep">|</span>
         <div class="metric-item"><span>已生成:</span><span class="metric-value" id="mTokens">0</span><span>tokens</span></div>
         <span class="metric-sep">|</span>
-        <div class="metric-item"><span>总耗时:</span><span class="metric-value" id="mElapsed">0.0</span><span>s</span></div>
+        <div class="metric-item"><span>上下文:</span><span class="metric-value" id="mCtx">0/8192</span></div>
+        <span class="metric-sep">|</span>
+        <div class="metric-item"><span>耗时:</span><span class="metric-value" id="mElapsed">0.0</span><span>s</span></div>
     </div>
 
     <!-- Chat Body -->
@@ -281,6 +283,7 @@ const mTTF = document.getElementById("mTTF");
 const mTPS = document.getElementById("mTPS");
 const mTokens = document.getElementById("mTokens");
 const mElapsed = document.getElementById("mElapsed");
+const mCtx = document.getElementById("mCtx");
 
 let chatMessages = [];
 let isGenerating = false;
@@ -293,6 +296,7 @@ function resetMetrics() {
     mTPS.textContent = "--";
     mTokens.textContent = "0";
     mElapsed.textContent = "0.0";
+    mCtx.textContent = "0/8192";
     if (elapsedInterval) { clearInterval(elapsedInterval); elapsedInterval = null; }
 }
 
@@ -442,6 +446,7 @@ async function sendMessage() {
                         if (p.ttf_ms > 0) mTTF.textContent = p.ttf_ms;
                         mTPS.textContent = p.tps;
                         mTokens.textContent = p.tokens;
+                        if (p.ctx_used) mCtx.textContent = p.ctx_used + "/" + p.ctx_max;
                     } catch(e) {}
                 }
             }

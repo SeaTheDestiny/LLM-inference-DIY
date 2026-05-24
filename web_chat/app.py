@@ -110,6 +110,8 @@ def chat():
     def generate():
         global engine_process
         init_engine()
+        prompt_len = len(token_ids)
+        ctx_max = 8192
 
         with engine_lock:
             engine_process.stdin.write("reset\n")
@@ -149,7 +151,8 @@ def chat():
                     elapsed = time.perf_counter() - t_start
                     tps = token_count / elapsed if elapsed > 0 else 0
                     ttf_ms = (t_first - t_start) * 1000 if t_first else 0
-                    yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
+                    ctx_used = prompt_len + token_count
+                    yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1), 'ctx_used':ctx_used, 'ctx_max':ctx_max})}\n\n"
 
             yield "data: [DONE]\n\n"
             

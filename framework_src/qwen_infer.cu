@@ -53,6 +53,8 @@ struct QwenWeights {
 #include "../kernels/hgemm_final.cuh"
 #include "../kernels/transpose.cuh"
 #include "../kernels/fused_qkv_rope_cache.cuh"
+#include "../kernels/flash_attn.cu"        // FA tuned_A for prefill
+#include "../kernels/gather_qkv.cuh"       // interleaved → per-head contiguous
 
 // ============================================================
 // Main High-Performance Inference Engine
@@ -83,6 +85,19 @@ private:
     // Flash Decoding temporary buffers
     half* d_fd_partial;   // [max_num_chunks, hidden_size]
     float* d_fd_lse;      // [max_num_chunks]
+
+    // Prefill batched buffers (for FA prefill stage)
+    half* d_prefill_x;    // [max_seqlen, H]
+    half* d_prefill_norm; // [max_seqlen, H]
+    half* d_prefill_qkv;  // [max_seqlen, 3H]
+    half* d_prefill_out;  // [max_seqlen, H]
+    half* d_prefill_q;    // [NH*max_seqlen, headDim] gathered Q for FA
+    half* d_prefill_k;    // [NH*max_seqlen, headDim] gathered K
+    half* d_prefill_v;    // [NH*max_seqlen, headDim] gathered V
+    half* d_prefill_w1;   // [max_seqlen, IM]
+    half* d_prefill_w2;   // [max_seqlen, IM]
+    half* d_prefill_act;  // [max_seqlen, IM]
+    half* d_prefill_proj; // [max_seqlen, H]
 
     // Allocate memory helper
     half* alloc_gpu(size_t size) {
@@ -243,6 +258,22 @@ public:
         int max_num_chunks = (config.max_seqlen + 255) / 256;
         d_fd_partial = alloc_gpu(max_num_chunks * config.hidden_size);
         cudaMalloc(&d_fd_lse, max_num_chunks * sizeof(float));
+
+        // Prefill batched buffers
+        size_t H = config.hidden_size;
+        size_t IM = config.intermediate_size;
+        size_t NH = config.num_heads;
+        d_prefill_x    = alloc_gpu(config.max_seqlen * H);
+        d_prefill_norm = alloc_gpu(config.max_seqlen * H);
+        d_prefill_qkv  = alloc_gpu(config.max_seqlen * 3 * H);
+        d_prefill_out  = alloc_gpu(config.max_seqlen * H);
+        d_prefill_q    = alloc_gpu(NH * config.max_seqlen * 128);
+        d_prefill_k    = alloc_gpu(NH * config.max_seqlen * 128);
+        d_prefill_v    = alloc_gpu(NH * config.max_seqlen * 128);
+        d_prefill_w1   = alloc_gpu(config.max_seqlen * IM);
+        d_prefill_w2   = alloc_gpu(config.max_seqlen * IM);
+        d_prefill_act  = alloc_gpu(config.max_seqlen * IM);
+        d_prefill_proj = alloc_gpu(config.max_seqlen * H);
     }
     
     ~QwenEngine() {
@@ -303,6 +334,95 @@ public:
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP
             );
         }
+    }
+
+    // ============================================================
+    // FA Prefill: batch-process all prompt tokens in one forward pass
+    // ============================================================
+    void prefill(const std::vector<int>& tokens, int& pos) {
+        int N = (int)tokens.size();
+        if (N == 0) return;
+        int H = (int)config.hidden_size;
+        int IM = (int)config.intermediate_size;
+        int NH = (int)config.num_heads;
+        constexpr int kHD = 128;
+        constexpr float eps = 1e-6f;
+
+        // 1. Embed all tokens
+        for (int i = 0; i < N; i++)
+            cudaMemcpy(d_prefill_x + (size_t)i * H,
+                       weights.wte + (size_t)tokens[i] * H,
+                       H * sizeof(half), cudaMemcpyDeviceToDevice);
+
+        // 2. Layers
+        for (unsigned int l = 0; l < config.num_layers; l++) {
+            // --- Attention ---
+            for (int i = 0; i < N; i++)
+                rmsnorm_kernel<<<1,512>>>(d_prefill_norm + (size_t)i * H,
+                    d_prefill_x + (size_t)i * H, weights.ln_1[l], H, eps);
+            gemm(d_prefill_qkv, d_prefill_norm, weights.qkv_w[l], N, 3*H, H);
+
+            for (int i = 0; i < N; i++) {
+                add_bias_kernel<<<24,256>>>(d_prefill_qkv + (size_t)i * 3 * H, weights.qkv_b[l], 3*H);
+                fused_qkv_rope_cache_kernel<<<NH,64>>>(d_prefill_qkv + (size_t)i * 3 * H,
+                    d_kv_cache_k + (size_t)l * config.max_seqlen * H,
+                    d_kv_cache_v + (size_t)l * config.max_seqlen * H,
+                    i, config.max_seqlen, NH, kHD);
+            }
+            cudaDeviceSynchronize();
+
+            // Gather Q + K + V into per-head contiguous buffers
+            gather_q_from_qkv(d_prefill_qkv, d_prefill_q, N, NH, kHD);
+            gather_kv_from_cache(d_kv_cache_k + (size_t)l * config.max_seqlen * H,
+                                 d_prefill_k, N, NH, kHD);
+            gather_kv_from_cache(d_kv_cache_v + (size_t)l * config.max_seqlen * H,
+                                 d_prefill_v, N, NH, kHD);
+            cudaDeviceSynchronize();
+
+            // Flash Attention per head
+            {
+                constexpr int Br=128, Bc=128;
+                int Tr = (N + Br - 1) / Br;
+                dim3 g(1, Tr), b(256);
+                constexpr int Q_sz=Br*(16+8), K_sz=Bc*(16+8);
+                int smem = 2*(Q_sz+K_sz)*sizeof(half);
+                auto fa = flash_attn_tuned_A_kernel<kHD,16,8,16,8,1,1,16,1,0,8,8,8,2,1>;
+                cudaFuncSetAttribute(fa, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+                for (int h = 0; h < NH; h++) {
+                    half* Qh = d_prefill_q + h * N * kHD;
+                    half* Kh = d_prefill_k + h * N * kHD;
+                    half* Vh = d_prefill_v + h * N * kHD;
+                    // FA output goes back to gathered buffer (overwrite Vh — OK, V no longer needed)
+                    fa<<<g, b, smem>>>(Qh, Kh, Vh, Vh, N, NH);
+                }
+                cudaDeviceSynchronize();
+            }
+
+            // Scatter FA output back to interleaved d_prefill_out
+            scatter_interleaved_kernel<kHD,256><<<(N*NH*kHD+255)/256, 256>>>(
+                d_prefill_v, d_prefill_out, N, NH, H);
+            cudaDeviceSynchronize();
+
+            // Output proj + residual
+            gemm(d_prefill_norm, d_prefill_out, weights.attn_proj_w[l], N, H, H);
+            for (int i = 0; i < N; i++)
+                add_bias_kernel<<<8,256>>>(d_prefill_x + (size_t)i * H, d_prefill_norm + (size_t)i * H, H);
+
+            // --- FFN ---
+            for (int i = 0; i < N; i++)
+                rmsnorm_kernel<<<1,512>>>(d_prefill_norm + (size_t)i * H,
+                    d_prefill_x + (size_t)i * H, weights.ln_2[l], H, eps);
+            gemm(d_prefill_w1, d_prefill_norm, weights.ffn_w1[l], N, IM, H);
+            gemm(d_prefill_w2, d_prefill_norm, weights.ffn_w2[l], N, IM, H);
+            for (int i = 0; i < N; i++)
+                swiglu_kernel<<<22,256>>>(d_prefill_act + (size_t)i * IM,
+                    d_prefill_w1 + (size_t)i * IM, d_prefill_w2 + (size_t)i * IM, IM);
+            gemm(d_prefill_proj, d_prefill_act, weights.ffn_proj_w[l], N, H, IM);
+            for (int i = 0; i < N; i++)
+                add_bias_kernel<<<8,256>>>(d_prefill_x + (size_t)i * H,
+                    d_prefill_proj + (size_t)i * H, H);
+        }
+        pos = N;
     }
 
     // Execute single-token Decode step (greedy search)
@@ -459,18 +579,17 @@ int main(int argc, char* argv[]) {
         
         if (prompt_tokens.empty()) continue;
         
-        // 1. Prefill stage
-        // In this lightweight C++ CLI harness, we prefill sequentially to keep the core execution extremely clean,
-        // and instantly switch to Flash Decoding for the autoregressive generation!
+        // 1. FA Prefill: batch all but last token through Flash Attention
         int pos = 0;
-        int last_token = prompt_tokens[0];
-        
-        for (size_t i = 1; i < prompt_tokens.size(); i++) {
-            // Warmup prefill tokens sequentially into KV cache
-            engine.step(last_token, pos);
-            pos++;
-            last_token = prompt_tokens[i];
+        int last_token;
+        if (prompt_tokens.size() > 1) {
+            std::vector<int> prefill_tokens(prompt_tokens.begin(), prompt_tokens.end() - 1);
+            engine.prefill(prefill_tokens, pos);
         }
+        // Feed last token through step() to produce initial logits
+        last_token = prompt_tokens.back();
+        engine.step(last_token, pos);
+        pos++;
         
         // 2. Decode generation stage
         int max_new_tokens = 512;

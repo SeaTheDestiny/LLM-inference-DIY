@@ -2000,6 +2000,7 @@ __global__ void __launch_bounds__(WARP_SIZE * kMmaTileSeqLenQ * kMmaTileSeqLenK)
         // Online Safe Softmax (__hmax, __expf, __fmaf_rn)
         // Causal mask (if enabled): token i only attends to tokens [0..i]
 #ifdef FLASH_ATTN_CAUSAL
+        #pragma message("FLASH_ATTN_CAUSAL is ACTIVE in tuned_A kernel")
         #pragma unroll
         for (int kt = 0; kt < kWarpTileSeqLenK; kt++) {
             half *hp0 = reinterpret_cast<half *>(&R_S[0][kt][0]);

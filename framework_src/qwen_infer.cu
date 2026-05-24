@@ -578,16 +578,14 @@ int main(int argc, char* argv[]) {
         
         if (prompt_tokens.empty()) continue;
         
-        // 1. FA Prefill: batch through causal Flash Attention
+        // 1. Prefill stage (step-by-step for stability; FA prefill in prefill() for future)
         int pos = 0;
-        int last_token;
-        if (prompt_tokens.size() > 1) {
-            std::vector<int> prefill_tokens(prompt_tokens.begin(), prompt_tokens.end() - 1);
-            engine.prefill(prefill_tokens, pos);
+        int last_token = prompt_tokens[0];
+        for (size_t i = 1; i < prompt_tokens.size(); i++) {
+            engine.step(last_token, pos);
+            pos++;
+            last_token = prompt_tokens[i];
         }
-        last_token = prompt_tokens.back();
-        engine.step(last_token, pos);
-        pos++;
         
         // 2. Decode generation stage
         int max_new_tokens = 512;

@@ -308,7 +308,7 @@ function appendMessage(role, text) {
     msgDiv.classList.add("message", role);
     const bubble = document.createElement("div");
     bubble.classList.add("message-bubble");
-    bubble.innerHTML = formatText(text);
+    bubble.innerHTML = text ? formatText(text) : "";
     const info = document.createElement("div");
     info.classList.add("message-info");
     info.textContent = role === "user" ? "你" : "Qwen-Inference";
@@ -319,32 +319,62 @@ function appendMessage(role, text) {
     return bubble;
 }
 
-// Typewriter: reveals text character by character
-function typewriterReveal(element, fullText, startIndex) {
-    let i = startIndex;
-    element.innerHTML = formatText(fullText.substring(0, i));
-    // cursor
-    const cursor = document.createElement('span');
-    cursor.classList.add('typewriter-cursor');
-    element.appendChild(cursor);
+// ---- Continuous Typewriter ----
+function startTypewriter(bubble) {
+    let fullText = "";
+    let revealIdx = 0;
+    let timer = null;
+    let finished = false;
 
-    const step = () => {
-        if (i >= fullText.length) {
-            if (element.querySelector('.typewriter-cursor'))
-                element.querySelector('.typewriter-cursor').remove();
-            return;
+    function tick() {
+        if (revealIdx < fullText.length) {
+            revealIdx++;
+            bubble.innerHTML = formatText(fullText.substring(0, revealIdx));
+            const c = document.createElement('span');
+            c.classList.add('typewriter-cursor');
+            bubble.appendChild(c);
+            scrollToBottom();
+            const delay = fullText.length > 200 ? 6 : (fullText.length > 60 ? 10 : 16);
+            timer = setTimeout(tick, delay);
+        } else if (!finished) {
+            // keep cursor blinking
+            const c = document.createElement('span');
+            c.classList.add('typewriter-cursor');
+            bubble.appendChild(c);
+            timer = setTimeout(tick, 200);
         }
-        i++;
-        element.innerHTML = formatText(fullText.substring(0, i));
-        const c = document.createElement('span');
-        c.classList.add('typewriter-cursor');
-        element.appendChild(c);
-        scrollToBottom();
-        // adaptive speed: faster for shorter text
-        let delay = fullText.length > 100 ? 8 : 15;
-        setTimeout(step, delay);
-    };
-    setTimeout(step, 5);
+    }
+
+    // API: called from SSE handler
+    function feed(newFullText) {
+        fullText = newFullText;
+        if (!timer) {
+            tick();
+        }
+    }
+
+    function done() {
+        finished = true;
+        if (timer) { clearTimeout(timer); timer = null; }
+        // final render without cursor
+        bubble.innerHTML = formatText(fullText);
+        // remove cursor if still there
+        const cur = bubble.querySelector('.typewriter-cursor');
+        if (cur) cur.remove();
+    }
+
+    return { feed, done };
+}
+    bubble.classList.add("message-bubble");
+    bubble.innerHTML = formatText(text);
+    const info = document.createElement("div");
+    info.classList.add("message-info");
+    info.textContent = role === "user" ? "你" : "Qwen-Inference";
+    msgDiv.appendChild(bubble);
+    msgDiv.appendChild(info);
+    chatBody.appendChild(msgDiv);
+    scrollToBottom();
+    return bubble;
 }
 
 chatInput.addEventListener("input", function() {
@@ -368,16 +398,15 @@ async function sendMessage() {
     chatMessages.push({ role: "user", content: prompt });
 
     const assistantBubble = appendMessage("assistant", "");
-    // typing dots
     const dots = document.createElement("div");
     dots.classList.add("typing-indicator");
     dots.innerHTML = '<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>';
     assistantBubble.appendChild(dots);
     scrollToBottom();
 
+    const tw = startTypewriter(assistantBubble);
     let fullResponse = "";
-    let typewriterStarted = false;
-    let lastTypeIdx = 0;
+    let firstToken = true;
     const tStart = performance.now();
 
     // elapsed timer
@@ -413,24 +442,24 @@ async function sendMessage() {
                         const p = JSON.parse(dataStr);
                         fullResponse += p.text;
 
+                        if (firstToken && p.text) {
+                            firstToken = false;
+                            if (dots.parentNode) dots.remove();
+                        }
+                        // Feed new text to typewriter
+                        tw.feed(fullResponse);
+
                         // Update metrics
                         if (p.ttf_ms > 0) mTTF.textContent = p.ttf_ms;
                         mTPS.textContent = p.tps;
                         mTokens.textContent = p.tokens;
-
-                        // Start typewriter on first token
-                        if (!typewriterStarted) {
-                            typewriterStarted = true;
-                            if (dots.parentNode) dots.remove();
-                            typewriterReveal(assistantBubble, fullResponse, 0);
-                            lastTypeIdx = fullResponse.length;
-                        }
                     } catch(e) {}
                 }
             }
         }
 
         chatMessages.push({ role: "assistant", content: fullResponse });
+        tw.done();
 
     } catch (error) {
         console.error("Inference error:", error);

@@ -131,34 +131,25 @@ def chat():
                 if not line:
                     break
                 line = line.strip()
+                if not line:
+                    continue
 
-                if "[GENERATION_START]" in line:
-                    line = line.replace("[GENERATION_START]", "").strip()
-                if "[GENERATION_END]" in line:
-                    line = line.replace("[GENERATION_END]", "").strip()
-                    if line:
-                        tokens = [int(t) for t in line.split() if t.lstrip('-').isdigit()]
-                        for t in tokens:
-                            token_count += 1
-                            if t_first is None:
-                                t_first = time.perf_counter()
-                            decoded = tok.decode([t])
-                            elapsed = time.perf_counter() - t_start
-                            tps = token_count / elapsed if elapsed > 0 else 0
-                            ttf_ms = (t_first - t_start) * 1000 if t_first else 0
-                            yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
+                if line == "[GENERATION_START]":
+                    continue
+                if line == "[GENERATION_END]":
                     break
-                if line:
-                    tokens = [int(t) for t in line.split() if t.lstrip('-').isdigit()]
-                    for t in tokens:
-                        token_count += 1
-                        if t_first is None:
-                            t_first = time.perf_counter()
-                        decoded = tok.decode([t])
-                        elapsed = time.perf_counter() - t_start
-                        tps = token_count / elapsed if elapsed > 0 else 0
-                        ttf_ms = (t_first - t_start) * 1000 if t_first else 0
-                        yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
+
+                # Each line is one token ID
+                if line.isdigit() or (line.startswith('-') and line[1:].isdigit()):
+                    t = int(line)
+                    token_count += 1
+                    if t_first is None:
+                        t_first = time.perf_counter()
+                    decoded = tok.decode([t])
+                    elapsed = time.perf_counter() - t_start
+                    tps = token_count / elapsed if elapsed > 0 else 0
+                    ttf_ms = (t_first - t_start) * 1000 if t_first else 0
+                    yield f"data: {json.dumps({'text':decoded, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1)})}\n\n"
 
             yield "data: [DONE]\n\n"
             

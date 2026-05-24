@@ -473,9 +473,8 @@ int main(int argc, char* argv[]) {
         }
         
         // 2. Decode generation stage
-        // Generate up to 256 tokens or until <|im_end|> special token (151645) is produced
         int max_new_tokens = 512;
-        std::cout << "[GENERATION_START]";
+        std::cout << "[GENERATION_START]" << std::endl;
         
         for (int step_idx = 0; step_idx < max_new_tokens; step_idx++) {
             int next_token = engine.step(last_token, pos);
@@ -486,8 +485,8 @@ int main(int argc, char* argv[]) {
                 break;
             }
             
-            // Print the produced token ID instantly to standard out (followed by space for parsing)
-            std::cout << next_token << " ";
+            // Print token and flush immediately for true streaming
+            std::cout << next_token << std::endl;
             last_token = next_token;
         }
         std::cout << "[GENERATION_END]" << std::endl;

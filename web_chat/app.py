@@ -113,18 +113,20 @@ def chat():
     # 3. Stream Generator with timing metrics
     def generate():
         global engine_process
+        # RESTART engine fresh for each request to avoid GPU state corruption
+        # that accumulates across multiple resets on the same engine instance.
+        with engine_lock:
+            if engine_process is not None:
+                engine_process.stdin.write("exit\n")
+                engine_process.stdin.flush()
+                try: engine_process.wait(timeout=3)
+                except: engine_process.terminate()
+                engine_process = None
         init_engine()
         prompt_len = len(token_ids)
         ctx_max = 8192
 
         with engine_lock:
-            engine_process.stdin.write("reset\n")
-            engine_process.stdin.flush()
-            while True:
-                line = engine_process.stdout.readline().strip()
-                if "[RESET_DONE]" in line:
-                    break
-
             t_start = time.perf_counter()
             t_first = None
             token_count = 0
@@ -172,7 +174,7 @@ def chat():
 
             yield "data: [DONE]\n\n"
             
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(generate(), mimetype=\"text/event-stream\")
 
 if __name__ == "__main__":
     # Pre-initialize on startup

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "hgemm_final.cuh"
+#include "hgemm_mma_swizzle.cuh"
 
 #define checkCuda(err) \
     if (err != cudaSuccess) { \
@@ -81,6 +82,25 @@ float run_hgemm_kernel(half *dA, half *dB, half *dC, int M, int N, int K,
     return ms;
 }
 
+// New swizzle kernel test (with proper SMEM layout + bounds checks)
+float run_hgemm_swizzle(half *dA, half *dB, half *dC, int M, int N, int K,
+                         cudaEvent_t start, cudaEvent_t stop) {
+    cudaMemset(dC, 0, M * N * sizeof(half));
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(start);
+    hgemm_swizzle_nn(dA, dB, dC, M, N, K);
+    cudaEventRecord(stop);
+
+    checkCuda(cudaGetLastError());
+    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaEventSynchronize(stop));
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    return ms;
+}
+
 // Element-wise error comparison (returns max absolute + relative error)
 void compare_results(const half *hgemm_out, const half *cublas_out,
                      int M, int N, float *max_abs_err, float *max_rel_err,
@@ -120,10 +140,11 @@ int main(int argc, char **argv) {
     printf("Tolerance: abs=1e-3, rel=1%%\n\n");
 
     // Allocate GPU memory
-    half *dA, *dB, *dC_hgemm, *dC_cublas;
+    half *dA, *dB, *dC_hgemm, *dC_swizzle, *dC_cublas;
     checkCuda(cudaMalloc(&dA, 128 * K * sizeof(half)));
     checkCuda(cudaMalloc(&dB, K * N_full * sizeof(half)));  // largest B
     checkCuda(cudaMalloc(&dC_hgemm, 128 * N_full * sizeof(half)));
+    checkCuda(cudaMalloc(&dC_swizzle, 128 * N_full * sizeof(half)));
     checkCuda(cudaMalloc(&dC_cublas, 128 * N_full * sizeof(half)));
 
     // Fill with realistic FP16 data (small random-like values)
@@ -144,91 +165,61 @@ int main(int argc, char **argv) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    int total_errors = 0;
-    int total_cases = 0;
+    int old_fails = 0, new_fails = 0;
 
     // Test all three matrix shape types
     struct { int N; const char *name; } shapes[] = {
-        {N_full, "QKV proj (3×H)"},
-        {N_attn, "Attn proj (H×H)"},
-        {N_ffn,  "FFN  proj (H×IM)"},
+        {N_full, "QKV proj (3xH)"},
+        {N_attn, "Attn proj (HxH)"},
+        {N_ffn,  "FFN  proj (HxIM)"},
     };
 
     for (int s = 0; s < 3; s++) {
         int N = shapes[s].N;
         printf("\n--- %s (N=%d) ---\n", shapes[s].name, N);
+        printf("%-9s %5s %8s %8s %8s %7s\n", "Kernel","M","max_abs","max_rel","errors","ms");
 
         for (int t = 0; t < num_tests; t++) {
             int M = test_Ms[t];
-            printf("  M=%3d: ", M);
-
-            // cuBLAS reference
             cublas_hgemm(dA, dB, dC_cublas, M, N, K, cublas_handle);
             checkCuda(cudaDeviceSynchronize());
 
-            // Our HGEMM (with swizzle=false, stage=2 — simplest config)
-            float ms = run_hgemm_kernel<false, 2>(dA, dB, dC_hgemm, M, N, K,
-                                                   start, stop);
+            // --- OLD kernel ---
+            float ms_o = run_hgemm_kernel<false, 2>(dA, dB, dC_hgemm, M, N, K, start, stop);
+            half *hc = (half*)malloc(M*N*sizeof(half)), *ho = (half*)malloc(M*N*sizeof(half));
+            checkCuda(cudaMemcpy(hc, dC_cublas, M*N*sizeof(half), cudaMemcpyDeviceToHost));
+            checkCuda(cudaMemcpy(ho, dC_hgemm,  M*N*sizeof(half), cudaMemcpyDeviceToHost));
+            float ao, ro; int eo;
+            compare_results(ho, hc, M, N, &ao, &ro, &eo, 1e-3f);
+            printf("%-9s %5d %8.4f %8.4f %8d %6.3f\n", eo?"OLD_FAIL":"OLD_PASS", M, ao, ro, eo, ms_o);
+            if (eo) old_fails++; free(hc); free(ho);
 
-            // Compare
-            half *h_cublas = (half*)malloc(M * N * sizeof(half));
-            half *h_hgemm  = (half*)malloc(M * N * sizeof(half));
-            checkCuda(cudaMemcpy(h_cublas, dC_cublas, M * N * sizeof(half),
-                                 cudaMemcpyDeviceToHost));
-            checkCuda(cudaMemcpy(h_hgemm, dC_hgemm, M * N * sizeof(half),
-                                 cudaMemcpyDeviceToHost));
-
-            float max_abs, max_rel;
-            int errs;
-            compare_results(h_hgemm, h_cublas, M, N,
-                           &max_abs, &max_rel, &errs, 1e-3f);
-
-            const char *status = (errs == 0) ? "PASS" : "FAIL";
-            printf("%s  max_abs=%.4f  max_rel=%.4f  errors=%d/%d  time=%.3f ms\n",
-                   status, max_abs, max_rel, errs, M * N, ms);
-
-            if (errs > 0) {
-                // Print first few error locations
-                int shown = 0;
-                for (int i = 0; i < M * N && shown < 5; i++) {
-                    float a = __half2float(h_hgemm[i]);
-                    float b = __half2float(h_cublas[i]);
-                    if (fabsf(a - b) > 1e-3f || fabsf(a - b) / fmaxf(fabsf(b), 1e-6f) > 0.01f) {
-                        printf("    [%d,%d] hgemm=%.6f cublas=%.6f diff=%.6f\n",
-                               i / N, i % N, a, b, a - b);
-                        shown++;
-                    }
-                }
-                total_errors += errs;
-            }
-            total_cases++;
-
-            free(h_cublas);
-            free(h_hgemm);
+            // --- NEW swizzle kernel ---
+            float ms_n = run_hgemm_swizzle(dA, dB, dC_swizzle, M, N, K, start, stop);
+            hc = (half*)malloc(M*N*sizeof(half));
+            half *hn = (half*)malloc(M*N*sizeof(half));
+            checkCuda(cudaMemcpy(hc, dC_cublas,  M*N*sizeof(half), cudaMemcpyDeviceToHost));
+            checkCuda(cudaMemcpy(hn, dC_swizzle, M*N*sizeof(half), cudaMemcpyDeviceToHost));
+            float an, rn; int en;
+            compare_results(hn, hc, M, N, &an, &rn, &en, 1e-3f);
+            printf("%-9s %5d %8.4f %8.4f %8d %6.3f\n", en?"NEW_FAIL":"NEW_PASS", M, an, rn, en, ms_n);
+            if (en) new_fails++; free(hc); free(hn);
         }
     }
 
+    printf("\n========================================\n");
+    printf("OLD kernel: %d/24 failed\n", old_fails);
+    printf("NEW kernel: %d/24 failed\n", new_fails);
+    printf(new_fails ? "NEW: still has issues\n" : "NEW: ALL 24 TESTS PASSED!\n");
+
     // Summary
     printf("\n========================================\n");
-    printf("SUMMARY: %d/%d cases passed\n",
-           total_cases - (total_errors > 0 ? 1 : 0), total_cases);
-    // Actually, count individual cases:
-    printf("Total error elements: %d\n", total_errors);
-
-    if (total_errors == 0) {
-        printf("ALL TESTS PASSED — hgemm_opt_kernel matches cuBLAS!\n");
-    }
-
     // Cleanup
     cublasDestroy(cublas_handle);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cudaFree(dA);
-    cudaFree(dB);
-    cudaFree(dC_hgemm);
-    cudaFree(dC_cublas);
-    free(hA);
-    free(hB);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
+    cudaFree(dA); cudaFree(dB);
+    cudaFree(dC_hgemm); cudaFree(dC_swizzle); cudaFree(dC_cublas);
+    free(hA); free(hB);
 
-    return total_errors > 0 ? 1 : 0;
+    return new_fails > 0 ? 1 : 0;
 }

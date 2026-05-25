@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
+
+// Self-developed HGEMM (replaces cuBLAS for prefill batched GEMM)
+#include "../kernels/hgemm_mma_swizzle.cuh"
 
 // Global volatile variable to prevent host compiler from optimizing away memory copies
 volatile float prevent_opt = 0.0f;
@@ -67,7 +69,6 @@ class QwenEngine {
 private:
     QwenConfig config;
     QwenWeights weights;
-    cublasHandle_t cublas_handle;
     
     // KV Cache in GPU VRAM
     half* d_kv_cache_k;   // [layers, max_seqlen, hidden_size]
@@ -113,7 +114,6 @@ private:
 
 public:
     QwenEngine(const std::string& model_path) {
-        cublasCreate(&cublas_handle);
         
         // 1. Read binary weights
         std::ifstream f(model_path, std::ios::binary);
@@ -283,7 +283,6 @@ public:
     }
     
     ~QwenEngine() {
-        cublasDestroy(cublas_handle);
         cudaFree(weights.wte);
         cudaFree(weights.ln_f);
         cudaFree(weights.lm_head);
@@ -322,20 +321,14 @@ public:
         cudaDeviceSynchronize();
     }
 
-    // High-performance Matrix Multiplication: HGEMV (m=1) / HGEMM (m>1)
+    // High-performance Matrix Multiplication — 100% self-developed
     void gemm(half* out, const half* in, const half* weight, int m, int n, int k) {
         if (m == 1) {
             int threads = 256;
             int blocks = (n + threads - 1) / threads;
             hgemv_kernel<<<blocks, threads>>>(in, weight, out, n, k);
         } else {
-            // Use ultra-robust and stable cuBLAS for batched prefill GEMM (m > 1)
-            half alpha = __float2half(1.0f);
-            half beta  = __float2half(0.0f);
-            cublasStatus_t status = cublasHgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &alpha, weight, n, in, k, &beta, out, n);
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                std::cerr << "[ERROR] cublasHgemm failed with status: " << status << std::endl;
-            }
+            hgemm_swizzle_nn(const_cast<half*>(in), const_cast<half*>(weight), out, m, n, k);
         }
     }
 

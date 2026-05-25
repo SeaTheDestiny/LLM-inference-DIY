@@ -199,10 +199,13 @@ hgemm_swizzle_kernel(
     #pragma unroll 1
     for (int k = (K_STAGE - 1); k < NUM_K_TILES; ++k) {
         reg_store ^= 1; reg_load ^= 1;
-        int smem_next = (k + 1) % K_STAGE;
-        int smem_cur  = k % K_STAGE;
+        // Double-buffer stage management:
+        //   smem_cur  = where valid data IS (read from here) = (k+1) % K_STAGE
+        //   smem_next = where new data GOES (write to here)  = k % K_STAGE
+        int smem_cur  = (k + 1) % K_STAGE;
+        int smem_next = k % K_STAGE;
 
-        // Prefetch next stage
+        // Prefetch next stage (WRITE to smem_next)
         int k_next = k * BK * WARP_TILE_K;
         if (gmem_a_m < M) {
             int gk_a = k_next + load_smem_a_k;

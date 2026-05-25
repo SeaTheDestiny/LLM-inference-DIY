@@ -174,7 +174,7 @@ def chat():
 
             yield "data: [DONE]\n\n"
             
-    return Response(generate(), mimetype=\"text/event-stream\")
+    return Response(generate(), mimetype="text/event-stream")
 
 if __name__ == "__main__":
     # Pre-initialize on startup

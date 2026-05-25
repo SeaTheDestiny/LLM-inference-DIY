@@ -4,6 +4,7 @@
 #include <cmath>
 #include <string>
 #include <chrono>
+#include <cstdlib>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -315,9 +316,42 @@ public:
         cudaFree(d_fd_lse);
     }
     void reset() {
-        size_t kv_cache_size = (size_t)config.num_layers * config.max_seqlen * config.hidden_size;
+        size_t H = (size_t)config.hidden_size;
+        size_t IM = (size_t)config.intermediate_size;
+        size_t NH = (size_t)config.num_heads;
+        size_t kv_cache_size = (size_t)config.num_layers * config.max_seqlen * H;
+        size_t max_num_chunks = (config.max_seqlen + 255) / 256;
+
         cudaMemset(d_kv_cache_k, 0, kv_cache_size * sizeof(half));
         cudaMemset(d_kv_cache_v, 0, kv_cache_size * sizeof(half));
+
+        cudaMemset(d_x, 0, H * sizeof(half));
+        cudaMemset(d_norm_x, 0, H * sizeof(half));
+        cudaMemset(d_qkv, 0, 3 * H * sizeof(half));
+        cudaMemset(d_qkv_out, 0, H * sizeof(half));
+        cudaMemset(d_attn_proj, 0, H * sizeof(half));
+        cudaMemset(d_ffn_w1, 0, IM * sizeof(half));
+        cudaMemset(d_ffn_w2, 0, IM * sizeof(half));
+        cudaMemset(d_ffn_act, 0, IM * sizeof(half));
+        cudaMemset(d_ffn_proj, 0, H * sizeof(half));
+        cudaMemset(d_logits, 0, (size_t)config.vocab_size * sizeof(half));
+        cudaMemset(d_next_token, 0, sizeof(int));
+
+        cudaMemset(d_fd_partial, 0, max_num_chunks * H * sizeof(half));
+        cudaMemset(d_fd_lse, 0, max_num_chunks * sizeof(float));
+
+        cudaMemset(d_prefill_x, 0, (size_t)config.max_seqlen * H * sizeof(half));
+        cudaMemset(d_prefill_norm, 0, (size_t)config.max_seqlen * H * sizeof(half));
+        cudaMemset(d_prefill_qkv, 0, (size_t)config.max_seqlen * 3 * H * sizeof(half));
+        cudaMemset(d_prefill_out, 0, (size_t)config.max_seqlen * H * sizeof(half));
+        cudaMemset(d_prefill_q, 0, (size_t)NH * config.max_seqlen * 128 * sizeof(half));
+        cudaMemset(d_prefill_k, 0, (size_t)NH * config.max_seqlen * 128 * sizeof(half));
+        cudaMemset(d_prefill_v, 0, (size_t)NH * config.max_seqlen * 128 * sizeof(half));
+        cudaMemset(d_prefill_o, 0, (size_t)NH * config.max_seqlen * 128 * sizeof(half));
+        cudaMemset(d_prefill_w1, 0, (size_t)config.max_seqlen * IM * sizeof(half));
+        cudaMemset(d_prefill_w2, 0, (size_t)config.max_seqlen * IM * sizeof(half));
+        cudaMemset(d_prefill_act, 0, (size_t)config.max_seqlen * IM * sizeof(half));
+        cudaMemset(d_prefill_proj, 0, (size_t)config.max_seqlen * H * sizeof(half));
         cudaDeviceSynchronize();
     }
 
@@ -353,6 +387,45 @@ public:
                 std::cerr << __half2float(tmp[i]) << " ";
             }
             std::cerr << std::endl;
+        };
+
+        const bool debug_finite_checks = (std::getenv("QWEN_DEBUG_FINITE") != nullptr);
+        const char* finite_log_path = std::getenv("QWEN_FINITE_LOG");
+
+        auto scan_tensor_finite = [&](const std::string& name, const half* d_ptr, int rows, int cols) {
+            if (!debug_finite_checks) return;
+
+            size_t count = (size_t)rows * (size_t)cols;
+            std::vector<half> host(count);
+            cudaMemcpy(host.data(), d_ptr, count * sizeof(half), cudaMemcpyDeviceToHost);
+
+            std::ofstream log_stream;
+            if (finite_log_path != nullptr) {
+                log_stream.open(finite_log_path, std::ios::app);
+            }
+
+            auto emit = [&](const std::string& line) {
+                std::cerr << line << std::endl;
+                if (log_stream.is_open()) {
+                    log_stream << line << '\n';
+                }
+            };
+
+            for (size_t idx = 0; idx < count; idx++) {
+                float value = __half2float(host[idx]);
+                if (!std::isfinite(value)) {
+                    int row = (int)(idx / (size_t)cols);
+                    int col = (int)(idx % (size_t)cols);
+                    emit("[NAN_CHECK] " + name +
+                         " first_bad=(row=" + std::to_string(row) +
+                         ", col=" + std::to_string(col) +
+                         ", idx=" + std::to_string(idx) +
+                         ") value=" + std::to_string(value));
+                    return;
+                }
+            }
+
+            emit("[NAN_CHECK] " + name + " all finite (" + std::to_string(count) + " values)");
         };
 
 #define CHECK_CUDA_ERR(msg) \
@@ -447,6 +520,7 @@ public:
 
             if (l == 0) {
                 dump_first_8("d_prefill_o (FA output)", d_prefill_o);
+                scan_tensor_finite("d_prefill_o (FA output)", d_prefill_o, N * NH, kHD);
             }
 
             // Scatter FA output back to interleaved d_prefill_out
@@ -457,6 +531,7 @@ public:
 
             if (l == 0) {
                 dump_first_8("d_prefill_out", d_prefill_out);
+                scan_tensor_finite("d_prefill_out", d_prefill_out, N, H);
             }
 
             if (l == 0) {
@@ -470,6 +545,7 @@ public:
 
             if (l == 0) {
                 dump_first_8("d_prefill_norm (after attn_proj gemm)", d_prefill_norm);
+                scan_tensor_finite("d_prefill_norm (after attn_proj gemm)", d_prefill_norm, N, H);
             }
 
             for (int i = 0; i < N; i++) {

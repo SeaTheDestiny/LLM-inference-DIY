@@ -4,14 +4,17 @@ import time
 import json
 import subprocess
 import threading
-from flask import Flask, request, Response, render_template
+from flask import Flask, request, Response, render_template, jsonify
 
 app = Flask(__name__, static_folder=".", template_folder=".")
 
 # 1. Path Configurations
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"))
-ENGINE_EXE = os.path.abspath(os.path.join(BASE_DIR, "../framework_src/qwen_infer.exe"))
+ENGINE_EXE = os.path.abspath(os.getenv(
+    "QWEN_ENGINE_EXE",
+    os.path.join(BASE_DIR, "../framework_src/qwen_infer.exe")
+))
 MODEL_BIN = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b.bin"))
 
 # Global subprocess handler & lock for thread safety
@@ -31,9 +34,10 @@ def get_tokenizer():
 def init_engine():
     global engine_process
     with engine_lock:
-        if engine_process is not None:
+        if engine_process is not None and engine_process.poll() is None:
             return
-            
+        engine_process = None
+
         print(f"[WEB_SERVER] Launching CUDA Inference Engine: {ENGINE_EXE}...")
         if not os.path.exists(ENGINE_EXE):
             print(f"[ERROR] Executable not found at {ENGINE_EXE}. Please compile framework_src first.")
@@ -70,20 +74,49 @@ def init_engine():
                 
         print("[WEB_SERVER] CUDA Inference Engine is connected and ready to stream!")
 
+def reset_engine():
+    init_engine()
+    with engine_lock:
+        if engine_process is None or engine_process.stdin is None or engine_process.stdout is None:
+            raise RuntimeError("CUDA inference engine is not ready for reset")
+
+        engine_process.stdin.write("reset\n")
+        engine_process.stdin.flush()
+
+        while True:
+            line = engine_process.stdout.readline()
+            if not line:
+                raise RuntimeError("CUDA inference engine exited during reset")
+            print(line.strip())
+            if "[RESET_DONE]" in line:
+                break
+
 # Ensure engine is shut down when server exits
 import atexit
 @atexit.register
 def cleanup():
     global engine_process
-    if engine_process is not None:
+    if engine_process is not None and engine_process.poll() is None:
         print("[WEB_SERVER] Shutting down C++/CUDA Inference Engine subprocess...")
         engine_process.terminate()
+        try:
+            engine_process.wait(timeout=5)
+        except Exception:
+            engine_process.kill()
         engine_process = None
 
 # 2. Main HTML Chat Interface Route
 @app.route("/")
 def index():
     return render_template("index.html")
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    try:
+        reset_engine()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 # 3. Server Sent Events (SSE) Real-Time Token Generation Route
 @app.route("/chat", methods=["POST"])
@@ -92,6 +125,7 @@ def chat():
     messages = data.get("messages", [])
     
     tok = get_tokenizer()
+    init_engine()
     
     # 1. Build prompt in TEXT-LEVEL ChatML format.
     #    Qwen's tiktoken tokenizer correctly maps <|im_start|> → 151644
@@ -113,19 +147,23 @@ def chat():
     # 3. Stream Generator with timing metrics
     def generate():
         global engine_process
-        # Restart engine every request: GPU state accumulates corruption across resets.
-        with engine_lock:
-            if engine_process is not None:
-                engine_process.terminate()
-                try: engine_process.wait(timeout=5)
-                except: engine_process.kill()
-                engine_process = None
-        init_engine()
-
         prompt_len = len(token_ids)
         ctx_max = 8192
 
         with engine_lock:
+            # ---- Reset engine state before every prompt ----
+            # Expanded reset() clears KV-cache, decode scratch, and all
+            # prefill workspace buffers to prevent cross-turn contamination.
+            engine_process.stdin.write("reset\n")
+            engine_process.stdin.flush()
+            while True:
+                line = engine_process.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if "[RESET_DONE]" in line:
+                    break
+
             t_start = time.perf_counter()
             t_first = None
             token_count = 0

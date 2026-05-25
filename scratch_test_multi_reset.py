@@ -3,7 +3,10 @@ import subprocess
 from transformers import AutoTokenizer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ENGINE_EXE = os.path.abspath(os.path.join(BASE_DIR, "framework_src/qwen_infer.exe"))
+ENGINE_EXE = os.path.abspath(os.getenv(
+    "QWEN_ENGINE_EXE",
+    os.path.join(BASE_DIR, "framework_src/qwen_infer.exe")
+))
 MODEL_BIN = os.path.abspath(os.path.join(BASE_DIR, "model_weights/qwen_1.8b.bin"))
 MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"))
 

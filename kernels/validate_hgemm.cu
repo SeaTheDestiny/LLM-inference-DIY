@@ -101,6 +101,31 @@ float run_hgemm_swizzle(half *dA, half *dB, half *dC, int M, int N, int K,
     return ms;
 }
 
+// Same kernel path, but intentionally reuses the output buffer without clearing it.
+// This mirrors the engine's persistent-process behavior more closely.
+float run_hgemm_swizzle_reuse(half *dA, half *dB, half *dC, int M, int N, int K,
+                              cudaEvent_t start, cudaEvent_t stop) {
+    cudaEventRecord(start);
+    hgemm_swizzle_nn(dA, dB, dC, M, N, K);
+    cudaEventRecord(stop);
+
+    checkCuda(cudaGetLastError());
+    checkCuda(cudaDeviceSynchronize());
+    checkCuda(cudaEventSynchronize(stop));
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    return ms;
+}
+
+static void fill_random_half_buffer(half *buffer, int count, unsigned int seed, float scale) {
+    srand(seed);
+    for (int i = 0; i < count; i++) {
+        float value = ((float)rand() / RAND_MAX - 0.5f) * scale;
+        buffer[i] = __float2half(value);
+    }
+}
+
 // Element-wise error comparison (returns max absolute + relative error)
 void compare_results(const half *hgemm_out, const half *cublas_out,
                      int M, int N, float *max_abs_err, float *max_rel_err,
@@ -206,6 +231,74 @@ int main(int argc, char **argv) {
             if (en) new_fails++; free(hc); free(hn);
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Persistent-sequence stress test:
+    // - run several m=1 GEMV launches to simulate decode-side usage
+    // - then run two attn-proj HGEMMs back-to-back without clearing the output
+    //   buffer between them, which mirrors the engine's persistent process path
+    // ---------------------------------------------------------------------
+    printf("\n=== Persistent Sequence Stress (decode-like preamble + reused output) ===\n");
+    const int seqN = N_attn;
+    const int seqShapes[][2] = {
+        {9, seqN},
+        {29, seqN},
+    };
+
+    half *dA_vec = nullptr;
+    half *dC_vec = nullptr;
+    checkCuda(cudaMalloc(&dA_vec, K * sizeof(half)));
+    checkCuda(cudaMalloc(&dC_vec, seqN * sizeof(half)));
+
+    half *hA_vec = (half*)malloc(K * sizeof(half));
+    half *hA_seq = (half*)malloc(128 * K * sizeof(half));
+
+    // Decode-like preamble: several single-token GEMVs using the shared weights buffer.
+    for (int step = 0; step < 4; step++) {
+        fill_random_half_buffer(hA_vec, K, 9000u + (unsigned int)step, 0.1f);
+        checkCuda(cudaMemcpy(dA_vec, hA_vec, K * sizeof(half), cudaMemcpyHostToDevice));
+        hgemv_kernel<<<(seqN + 255) / 256, 256>>>(dA_vec, dB, dC_vec, seqN, K);
+        checkCuda(cudaGetLastError());
+        checkCuda(cudaDeviceSynchronize());
+    }
+
+    for (int seq = 0; seq < 2; seq++) {
+        int M = seqShapes[seq][0];
+        int N = seqShapes[seq][1];
+        fill_random_half_buffer(hA_seq, 128 * K, 12000u + (unsigned int)seq, 0.1f);
+        checkCuda(cudaMemcpy(dA, hA_seq, 128 * K * sizeof(half), cudaMemcpyHostToDevice));
+
+        cublas_hgemm(dA, dB, dC_cublas, M, N, K, cublas_handle);
+        checkCuda(cudaDeviceSynchronize());
+
+        float ms = run_hgemm_swizzle_reuse(dA, dB, dC_swizzle, M, N, K, start, stop);
+
+        half *hc = (half*)malloc(M * N * sizeof(half));
+        half *hs = (half*)malloc(M * N * sizeof(half));
+        checkCuda(cudaMemcpy(hc, dC_cublas, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+        checkCuda(cudaMemcpy(hs, dC_swizzle, M * N * sizeof(half), cudaMemcpyDeviceToHost));
+
+        float abs_err, rel_err;
+        int err_count;
+        compare_results(hs, hc, M, N, &abs_err, &rel_err, &err_count, 1e-3f);
+        printf("SEQ %-6s %5d %8.4f %8.4f %8d %6.3f\n",
+               seq == 0 ? "small" : "large", M, abs_err, rel_err, err_count, ms);
+        printf("    ref_head = %.6f  swizzle_head = %.6f\n",
+               __half2float(hc[0]), __half2float(hs[0]));
+        if (err_count) {
+            printf("    RESULT   = FAIL (persistent reuse stress)\n");
+        } else {
+            printf("    RESULT   = PASS\n");
+        }
+
+        free(hc);
+        free(hs);
+    }
+
+    free(hA_vec);
+    free(hA_seq);
+    cudaFree(dA_vec);
+    cudaFree(dC_vec);
 
     printf("\n========================================\n");
     printf("OLD kernel: %d/24 failed\n", old_fails);

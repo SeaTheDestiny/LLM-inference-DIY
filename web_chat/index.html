@@ -474,14 +474,20 @@ chatInput.addEventListener("keydown", function(e) {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
-btnReset.addEventListener("click", function() {
+btnReset.addEventListener("click", async function() {
     chatMessages = [];
     resetMetrics();
     chatBody.innerHTML = `<div class="message assistant">
-        <div class="message-bubble">对话上下文与 GPU KV Cache 已完全重置。🧹<br><br>开启新一轮超低延迟生成对话！</div>
+        <div class="message-bubble">对话上下文已清空。下一轮请求会自动重建干净 GPU 状态。🧹<br><br>开启新一轮超低延迟生成对话！</div>
         <div class="message-info">Qwen-Inference</div>
     </div>`;
     scrollToBottom();
+
+    try {
+        await fetch("/reset", { method: "POST" });
+    } catch (error) {
+        console.error("Reset request failed:", error);
+    }
 });
 </script>
 </body>

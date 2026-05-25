@@ -113,16 +113,15 @@ def chat():
     # 3. Stream Generator with timing metrics
     def generate():
         global engine_process
-        # RESTART engine fresh for each request to avoid GPU state corruption
-        # that accumulates across multiple resets on the same engine instance.
+        # Restart engine every request: GPU state accumulates corruption across resets.
         with engine_lock:
             if engine_process is not None:
-                engine_process.stdin.write("exit\n")
-                engine_process.stdin.flush()
-                try: engine_process.wait(timeout=3)
-                except: engine_process.terminate()
+                engine_process.terminate()
+                try: engine_process.wait(timeout=5)
+                except: engine_process.kill()
                 engine_process = None
         init_engine()
+
         prompt_len = len(token_ids)
         ctx_max = 8192
 
@@ -130,10 +129,6 @@ def chat():
             t_start = time.perf_counter()
             t_first = None
             token_count = 0
-            # Accumulate all generated tokens so we can decode them TOGETHER.
-            # Decoding one token at a time (tok.decode([t])) corrupts multi-byte
-            # characters (Chinese, emoji, etc.) that span multiple tokens —
-            # each partial token becomes "�", contaminating the next turn's context.
             all_tokens = []
 
             engine_process.stdin.write(token_str + "\n")
@@ -155,16 +150,12 @@ def chat():
                 # Each line is one token ID
                 if line.isdigit() or (line.startswith('-') and line[1:].isdigit()):
                     t = int(line)
-                    # Stop at ChatML end tokens per Qwen spec:
-                    # 151645 = <|im_end|>, 151643 = <|endoftext|>
                     if t in (151643, 151645):
                         break
                     token_count += 1
                     if t_first is None:
                         t_first = time.perf_counter()
                     all_tokens.append(t)
-                    # Decode ALL accumulated tokens together to preserve
-                    # multi-byte character integrity across token boundaries.
                     full_text = tok.decode(all_tokens)
                     elapsed = time.perf_counter() - t_start
                     tps = token_count / elapsed if elapsed > 0 else 0

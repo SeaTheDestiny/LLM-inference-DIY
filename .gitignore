@@ -6,6 +6,18 @@
 *.dll
 *.exp
 *.pdb
+*.dylib
+*.so
+framework_src/qwen_infer
+framework_src/qwen_infer_debug
+kernels/test_flash_attn
+kernels/bench_fd_opt
+kernels/bench_flash_attn
+kernels/bench_hgemm
+kernels/bench_hgemm_full
+kernels/validate_hgemm
+kernels/tune_hgemm
+kernels/unit_tests/run_tests
 
 # Python virtual environment
 .venv/

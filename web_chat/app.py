@@ -8,7 +8,6 @@ from flask import Flask, request, Response, render_template, jsonify
 
 app = Flask(__name__, static_folder=".", template_folder=".")
 
-# 1. Path Configurations
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.abspath(os.getenv(
     "QWEN_MODEL_DIR",
@@ -23,10 +22,20 @@ MODEL_BIN = os.path.abspath(os.getenv(
     os.path.join(BASE_DIR, "../model_weights/qwen_1.8b.bin")
 ))
 
-# Global subprocess handler & lock for thread safety
 engine_process = None
-engine_lock = threading.Lock()
+engine_stderr_drainer = None
+engine_lock = threading.RLock()
 tokenizer = None
+
+
+def _drain_stderr(proc):
+    """Background thread: consume stderr so the pipe never fills."""
+    try:
+        for line in proc.stderr:
+            pass
+    except (ValueError, OSError):
+        pass
+
 
 def get_tokenizer():
     global tokenizer
@@ -37,68 +46,93 @@ def get_tokenizer():
         print("[WEB_SERVER] Tokenizer loaded successfully.")
     return tokenizer
 
+
+def _engine_alive():
+    return engine_process is not None and engine_process.poll() is None
+
+
 def init_engine():
-    global engine_process
+    global engine_process, engine_stderr_drainer
     with engine_lock:
-        if engine_process is not None and engine_process.poll() is None:
+        if _engine_alive():
             return
         engine_process = None
+        engine_stderr_drainer = None
 
         print(f"[WEB_SERVER] Launching CUDA Inference Engine: {ENGINE_EXE}...")
         if not os.path.exists(ENGINE_EXE):
-            print(f"[ERROR] Executable not found at {ENGINE_EXE}. Please compile framework_src first.")
+            print(f"[ERROR] Executable not found at {ENGINE_EXE}. Compile framework_src first.")
             sys.exit(1)
         if not os.path.exists(MODEL_BIN):
-            print(f"[ERROR] Packed model weights not found at {MODEL_BIN}. Please run weight converter first.")
+            print(f"[ERROR] Packed model weights not found at {MODEL_BIN}. Run convert_weights.py first.")
             sys.exit(1)
-            
-        # Start qwen_infer subprocess in framework_src working dir
-        # Merge stderr → stdout to avoid pipe buffer deadlock:
-        # The C++ engine writes extensive [DUMP]/[STEP_DUMP] debug output to stderr,
-        # which would fill the pipe and block the subprocess if not consumed.
+
         engine_process = subprocess.Popen(
-            [os.path.abspath(ENGINE_EXE), os.path.abspath(MODEL_BIN)],
-            cwd=os.path.abspath(os.path.join(BASE_DIR, "../framework_src")),
+            [ENGINE_EXE, MODEL_BIN],
+            cwd=os.path.join(BASE_DIR, "../framework_src"),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
-            bufsize=1
+            bufsize=1,
         )
-        
-        # Read stdout (which now includes merged stderr) until [ENGINE_READY] is printed
+
+        threading.Thread(
+            target=_drain_stderr, args=(engine_process,),
+            daemon=True
+        ).start()
+
         print("[WEB_SERVER] Waiting for CUDA GPU VRAM initialization and weights loading...")
         while True:
             line = engine_process.stdout.readline()
             if not line:
-                # Subprocess exited unexpectedly (stdout closed)
-                print("[ERROR] Engine exited unexpectedly during startup. Check framework_src/stderr.txt for details.")
+                print("[ERROR] Engine exited unexpectedly during startup.")
                 sys.exit(1)
-            print(line.strip())
+            line = line.strip()
+            if line:
+                print(line)
             if "[ENGINE_READY]" in line:
                 break
-                
+
         print("[WEB_SERVER] CUDA Inference Engine is connected and ready to stream!")
+
+
+def _read_until(stdout, marker, label):
+    """Read lines from stdout until marker is found.  Returns True on success."""
+    while True:
+        line = stdout.readline()
+        if not line:
+            print(f"[ERROR] Engine exited while waiting for {label}")
+            return False
+        line = line.strip()
+        if line and marker in line:
+            return True
+
+
+def _send_command(cmd):
+    """Write a command to engine stdin.  Returns True if write succeeded."""
+    try:
+        engine_process.stdin.write(cmd + "\n")
+        engine_process.stdin.flush()
+        return True
+    except (OSError, ValueError):
+        return False
+
 
 def reset_engine():
     init_engine()
     with engine_lock:
-        if engine_process is None or engine_process.stdin is None or engine_process.stdout is None:
+        if not _engine_alive() or engine_process.stdin is None or engine_process.stdout is None:
             raise RuntimeError("CUDA inference engine is not ready for reset")
+        if not _send_command("reset"):
+            raise RuntimeError("Engine stdin closed")
+        if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_DONE"):
+            raise RuntimeError("CUDA inference engine exited during reset")
 
-        engine_process.stdin.write("reset\n")
-        engine_process.stdin.flush()
 
-        while True:
-            line = engine_process.stdout.readline()
-            if not line:
-                raise RuntimeError("CUDA inference engine exited during reset")
-            print(line.strip())
-            if "[RESET_DONE]" in line:
-                break
-
-# Ensure engine is shut down when server exits
 import atexit
+
+
 @atexit.register
 def cleanup():
     global engine_process
@@ -111,10 +145,11 @@ def cleanup():
             engine_process.kill()
         engine_process = None
 
-# 2. Main HTML Chat Interface Route
+
 @app.route("/")
 def index():
     return render_template("index.html")
+
 
 @app.route("/reset", methods=["POST"])
 def reset():
@@ -124,59 +159,51 @@ def reset():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
-# 3. Server Sent Events (SSE) Real-Time Token Generation Route
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.json
     messages = data.get("messages", [])
-    
+
     tok = get_tokenizer()
     init_engine()
-    
-    # 1. Build prompt in TEXT-LEVEL ChatML format.
-    #    Qwen's tiktoken tokenizer correctly maps <|im_start|> → 151644
-    #    and <|im_end|> → 151645 as special tokens when encoding the full text.
-    #    Token-level assembly with allowed_special=set() risks BPE mismatches.
+
     formatted_prompt = ""
     for msg in messages:
         role = msg["role"]
         content = msg["content"]
         formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    # End with assistant prompt start (NO <|im_end|> — the model completes it)
     formatted_prompt += "<|im_start|>assistant\n"
-    
-    # 2. Encode the full prompt text → tokenizer handles special tokens natively
+
     token_ids = tok.encode(formatted_prompt)
     token_str = " ".join(str(tid) for tid in token_ids)
     print(f"[WEB_SERVER] Encoded prompt tokens ({len(token_ids)}): {token_str[:80]}...")
-    
-    # 3. Stream Generator with timing metrics
+
     def generate():
         global engine_process
         prompt_len = len(token_ids)
         ctx_max = 8192
 
         with engine_lock:
-            # ---- Reset engine state before every prompt ----
-            # Expanded reset() clears KV-cache, decode scratch, and all
-            # prefill workspace buffers to prevent cross-turn contamination.
-            engine_process.stdin.write("reset\n")
-            engine_process.stdin.flush()
-            while True:
-                line = engine_process.stdout.readline()
-                if not line:
-                    break
-                line = line.strip()
-                if "[RESET_DONE]" in line:
-                    break
+            if not _engine_alive() or engine_process.stdin is None:
+                yield "data: {\"error\":\"engine not running\"}\n\n"
+                return
+
+            if not _send_command("reset"):
+                yield "data: {\"error\":\"engine stdin closed\"}\n\n"
+                return
+            if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_DONE"):
+                yield "data: {\"error\":\"engine exited during reset\"}\n\n"
+                return
 
             t_start = time.perf_counter()
             t_first = None
             token_count = 0
             all_tokens = []
 
-            engine_process.stdin.write(token_str + "\n")
-            engine_process.stdin.flush()
+            if not _send_command(token_str):
+                yield "data: {\"error\":\"engine stdin closed\"}\n\n"
+                return
 
             while True:
                 line = engine_process.stdout.readline()
@@ -191,28 +218,32 @@ def chat():
                 if line == "[GENERATION_END]":
                     break
 
-                # Each line is one token ID
                 if line.isdigit() or (line.startswith('-') and line[1:].isdigit()):
                     t = int(line)
                     if t in (151643, 151645):
                         break
+                    if t < 0 or t >= 151936:
+                        continue
                     token_count += 1
                     if t_first is None:
                         t_first = time.perf_counter()
                     all_tokens.append(t)
-                    full_text = tok.decode(all_tokens)
+                    try:
+                        full_text = tok.decode(all_tokens)
+                    except (OverflowError, ValueError, UnicodeDecodeError):
+                        full_text = "[?]"
                     elapsed = time.perf_counter() - t_start
                     tps = token_count / elapsed if elapsed > 0 else 0
                     ttf_ms = (t_first - t_start) * 1000 if t_first else 0
                     ctx_used = prompt_len + token_count
-                    yield f"data: {json.dumps({'text':full_text, 'tokens':token_count, 'tps':round(tps,1), 'ttf_ms':round(ttf_ms,1), 'ctx_used':ctx_used, 'ctx_max':ctx_max})}\n\n"
+                    yield f"data: {json.dumps({'text': full_text, 'tokens': token_count, 'tps': round(tps, 1), 'ttf_ms': round(ttf_ms, 1), 'ctx_used': ctx_used, 'ctx_max': ctx_max})}\n\n"
 
             yield "data: [DONE]\n\n"
-            
+
     return Response(generate(), mimetype="text/event-stream")
 
+
 if __name__ == "__main__":
-    # Pre-initialize on startup
     init_engine()
     print("\n* Web Server starting at: http://127.0.0.1:5000")
     app.run(host="127.0.0.1", port=5000, debug=False)

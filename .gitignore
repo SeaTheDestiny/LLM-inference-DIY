@@ -25,6 +25,7 @@ kernels/unit_tests/run_tests
 # Model weights (large files)
 model_weights/*.bin
 model_weights/*.safetensors
+model_weights/qwen_1.8b_chat/
 
 # Generated CSV / logs
 *.csv

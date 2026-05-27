@@ -10,12 +10,18 @@ app = Flask(__name__, static_folder=".", template_folder=".")
 
 # 1. Path Configurations
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b_chat/qwen/Qwen-1_8B-Chat"))
+MODEL_DIR = os.path.abspath(os.getenv(
+    "QWEN_MODEL_DIR",
+    os.path.join(BASE_DIR, "../model_weights/qwen_1.8b_chat")
+))
 ENGINE_EXE = os.path.abspath(os.getenv(
     "QWEN_ENGINE_EXE",
-    os.path.join(BASE_DIR, "../framework_src/qwen_infer.exe")
+    os.path.join(BASE_DIR, "../framework_src/qwen_infer")
 ))
-MODEL_BIN = os.path.abspath(os.path.join(BASE_DIR, "../model_weights/qwen_1.8b.bin"))
+MODEL_BIN = os.path.abspath(os.getenv(
+    "QWEN_MODEL_BIN",
+    os.path.join(BASE_DIR, "../model_weights/qwen_1.8b.bin")
+))
 
 # Global subprocess handler & lock for thread safety
 engine_process = None

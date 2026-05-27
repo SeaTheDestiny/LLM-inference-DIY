@@ -23,18 +23,8 @@ MODEL_BIN = os.path.abspath(os.getenv(
 ))
 
 engine_process = None
-engine_stderr_drainer = None
 engine_lock = threading.RLock()
 tokenizer = None
-
-
-def _drain_stderr(proc):
-    """Background thread: consume stderr so the pipe never fills."""
-    try:
-        for line in proc.stderr:
-            pass
-    except (ValueError, OSError):
-        pass
 
 
 def get_tokenizer():
@@ -52,12 +42,11 @@ def _engine_alive():
 
 
 def init_engine():
-    global engine_process, engine_stderr_drainer
+    global engine_process
     with engine_lock:
         if _engine_alive():
             return
         engine_process = None
-        engine_stderr_drainer = None
 
         print(f"[WEB_SERVER] Launching CUDA Inference Engine: {ENGINE_EXE}...")
         if not os.path.exists(ENGINE_EXE):
@@ -72,15 +61,10 @@ def init_engine():
             cwd=os.path.join(BASE_DIR, "../framework_src"),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
-
-        threading.Thread(
-            target=_drain_stderr, args=(engine_process,),
-            daemon=True
-        ).start()
 
         print("[WEB_SERVER] Waiting for CUDA GPU VRAM initialization and weights loading...")
         while True:

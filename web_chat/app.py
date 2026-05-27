@@ -26,6 +26,10 @@ engine_process = None
 engine_lock = threading.RLock()
 tokenizer = None
 
+def _log(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
 
 def get_tokenizer():
     global tokenizer
@@ -82,11 +86,10 @@ def init_engine():
 
 
 def _read_until(stdout, marker, label):
-    """Read lines from stdout until marker is found.  Returns True on success."""
     while True:
         line = stdout.readline()
         if not line:
-            print(f"[ERROR] Engine exited while waiting for {label}")
+            _log(f"[read_until:{label}] EOF waiting for {marker}")
             return False
         line = line.strip()
         if line and marker in line:
@@ -108,10 +111,12 @@ def reset_engine():
     with engine_lock:
         if not _engine_alive() or engine_process.stdin is None or engine_process.stdout is None:
             raise RuntimeError("CUDA inference engine is not ready for reset")
+        _log("[RESET_ENGINE] sending reset")
         if not _send_command("reset"):
             raise RuntimeError("Engine stdin closed")
-        if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_DONE"):
+        if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_ENGINE"):
             raise RuntimeError("CUDA inference engine exited during reset")
+        _log("[RESET_ENGINE] done")
 
 
 import atexit
@@ -161,52 +166,66 @@ def chat():
 
     token_ids = tok.encode(formatted_prompt)
     token_str = " ".join(str(tid) for tid in token_ids)
-    print(f"[WEB_SERVER] Encoded prompt tokens ({len(token_ids)}): {token_str[:80]}...")
+    _log(f"[WEB_SERVER] Encoded prompt tokens ({len(token_ids)}): {token_str[:80]}...")
 
     def generate():
         global engine_process
         prompt_len = len(token_ids)
         ctx_max = 8192
+        label = f"chat({len(token_ids)}t)"
 
         with engine_lock:
             if not _engine_alive() or engine_process.stdin is None:
-                yield "data: {\"error\":\"engine not running\"}\n\n"
+                _log(f"[CHAT:GEN] {label} engine not running")
+                yield "data: [DONE]\n\n"
                 return
 
+            _log(f"[CHAT:GEN] {label} reset start")
             if not _send_command("reset"):
-                yield "data: {\"error\":\"engine stdin closed\"}\n\n"
+                _log(f"[CHAT:GEN] {label} reset write failed")
+                yield "data: [DONE]\n\n"
                 return
-            if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_DONE"):
-                yield "data: {\"error\":\"engine exited during reset\"}\n\n"
+            if not _read_until(engine_process.stdout, "[RESET_DONE]", label + " RESET_DONE"):
+                _log(f"[CHAT:GEN] {label} reset read failed")
+                yield "data: [DONE]\n\n"
                 return
+            _log(f"[CHAT:GEN] {label} reset done")
 
             t_start = time.perf_counter()
             t_first = None
             token_count = 0
             all_tokens = []
 
+            _log(f"[CHAT:GEN] {label} sending tokens")
             if not _send_command(token_str):
-                yield "data: {\"error\":\"engine stdin closed\"}\n\n"
+                _log(f"[CHAT:GEN] {label} token write failed")
+                yield "data: [DONE]\n\n"
                 return
+            _log(f"[CHAT:GEN] {label} tokens sent, reading output")
 
             while True:
                 line = engine_process.stdout.readline()
                 if not line:
+                    _log(f"[CHAT:GEN] {label} EOF after {token_count} tokens")
                     break
                 line = line.strip()
                 if not line:
                     continue
 
                 if line == "[GENERATION_START]":
+                    _log(f"[CHAT:GEN] {label} GEN_START")
                     continue
                 if line == "[GENERATION_END]":
+                    _log(f"[CHAT:GEN] {label} GEN_END ({token_count} tokens)")
                     break
 
                 if line.isdigit() or (line.startswith('-') and line[1:].isdigit()):
                     t = int(line)
                     if t in (151643, 151645):
+                        _log(f"[CHAT:GEN] {label} stop token {t}")
                         break
                     if t < 0 or t >= 151936:
+                        _log(f"[CHAT:GEN] {label} bad token {t}, skip")
                         continue
                     token_count += 1
                     if t_first is None:
@@ -222,6 +241,7 @@ def chat():
                     ctx_used = prompt_len + token_count
                     yield f"data: {json.dumps({'text': full_text, 'tokens': token_count, 'tps': round(tps, 1), 'ttf_ms': round(ttf_ms, 1), 'ctx_used': ctx_used, 'ctx_max': ctx_max})}\n\n"
 
+            _log(f"[CHAT:GEN] {label} done, yielding [DONE]")
             yield "data: [DONE]\n\n"
 
     return Response(generate(), mimetype="text/event-stream")

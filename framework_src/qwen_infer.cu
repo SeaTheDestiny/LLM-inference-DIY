@@ -614,7 +614,7 @@ public:
     int step(int token_id, int pos) {
         // 1. Embedding lookup
         // Copys a row of hidden_size elements from wte based on token_id
-        cudaMemcpy(d_x, weights.wte + token_id * config.hidden_size, config.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(d_x, weights.wte + (size_t)token_id * config.hidden_size, config.hidden_size * sizeof(half), cudaMemcpyDeviceToDevice);
         
         // Constants
         constexpr float epsilon = 1e-6f;
@@ -684,10 +684,16 @@ public:
             if (i == 0) {
                 half tmp[8];
                 cudaMemcpy(tmp, d_qkv_out, 8 * sizeof(half), cudaMemcpyDeviceToHost);
+                bool has_nan = false;
+                for (int idx = 0; idx < 8; idx++) {
+                    float fv = __half2float(tmp[idx]);
+                    if (!std::isfinite(fv)) has_nan = true;
+                }
                 std::cerr << "[STEP_DUMP] L0 d_qkv_out: ";
                 for (int idx = 0; idx < 8; idx++) {
                     std::cerr << __half2float(tmp[idx]) << " ";
                 }
+                if (has_nan) std::cerr << " ***NAN***";
                 std::cerr << std::endl;
             }
             

@@ -107,16 +107,47 @@ def _send_command(cmd):
 
 
 def reset_engine():
-    init_engine()
+    """Restart the engine subprocess for a completely clean GPU state."""
+    global engine_process
     with engine_lock:
-        if not _engine_alive() or engine_process.stdin is None or engine_process.stdout is None:
-            raise RuntimeError("CUDA inference engine is not ready for reset")
-        _log("[RESET_ENGINE] sending reset")
-        if not _send_command("reset"):
-            raise RuntimeError("Engine stdin closed")
-        if not _read_until(engine_process.stdout, "[RESET_DONE]", "RESET_ENGINE"):
-            raise RuntimeError("CUDA inference engine exited during reset")
-        _log("[RESET_ENGINE] done")
+        if engine_process is not None:
+            _log("[RESET_ENGINE] terminating engine for full restart")
+            engine_process.stdin.write("exit\n")
+            engine_process.stdin.flush()
+            try:
+                engine_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                engine_process.terminate()
+                try:
+                    engine_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    engine_process.kill()
+                    engine_process.wait(timeout=5)
+            engine_process = None
+
+        if not os.path.exists(ENGINE_EXE):
+            raise RuntimeError(f"Executable not found at {ENGINE_EXE}.")
+        if not os.path.exists(MODEL_BIN):
+            raise RuntimeError(f"Model weights not found at {MODEL_BIN}.")
+
+        engine_process = subprocess.Popen(
+            [ENGINE_EXE, MODEL_BIN],
+            cwd=os.path.join(BASE_DIR, "../framework_src"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        _log("[RESET_ENGINE] waiting for new engine startup")
+        while True:
+            line = engine_process.stdout.readline()
+            if not line:
+                raise RuntimeError("Engine exited during restart startup")
+            if "[ENGINE_READY]" in line:
+                break
+        _log("[RESET_ENGINE] new engine ready")
 
 
 import atexit
